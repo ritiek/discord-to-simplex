@@ -8,7 +8,17 @@ pkgs.buildGoModule {
 
   inherit vendorHash;
 
-  nativeBuildInputs = pkgs.lib.optional (!pkgs.stdenv.isDarwin) [ pkgs.golangci-lint ];
+  # nativeBuildInputs = pkgs.lib.optional (!pkgs.stdenv.isDarwin) [ pkgs.golangci-lint ];
+  nativeBuildInputs = with pkgs; [
+    golangci-lint
+    sqlcipher
+    openssl
+  ];
+
+  buildInputs = with pkgs; [
+    sqlcipher
+    openssl
+  ];
 
   checkPhase = ''
     runHook preCheck

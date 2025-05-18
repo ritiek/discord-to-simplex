@@ -19,8 +19,8 @@
       ];
       perSystem = { config, self', inputs', pkgs, system, ... }: {
         packages = {
-          ssh-to-age = (pkgs.callPackage ./default.nix { });
-          default = config.packages.ssh-to-age;
+          discord-to-simplex = (pkgs.callPackage ./default.nix { });
+          default = config.packages.discord-to-simplex;
         };
         checks =
           let
@@ -28,11 +28,11 @@
             devShells = lib.mapAttrs' (n: lib.nameValuePair "devShell-${n}") self'.devShells;
           in
           {
-            cross-build = self'.packages.ssh-to-age.overrideAttrs (old: {
+            cross-build = self'.packages.discord-to-simplex.overrideAttrs (old: {
               nativeBuildInputs = old.nativeBuildInputs ++ [ pkgs.gox ];
               buildPhase = ''
                 runHook preBuild
-                HOME=$TMPDIR gox -verbose -osarch '!darwin/386' ./cmd/ssh-to-age/
+                HOME=$TMPDIR gox -verbose -osarch '!darwin/386' ./cmd/discord-to-simplex/
                 runHook postBuild
               '';
               doCheck = false;
