@@ -4,6 +4,7 @@ import (
     "database/sql"
     "encoding/base64"
     "encoding/json"
+    "path/filepath"
     "flag"
     "fmt"
     "io/ioutil"
@@ -44,29 +45,29 @@ type UniversalMessage struct {
     Content     string     `json:"content"`
     Timestamp   time.Time  `json:"timestamp"`
     EditedAt    *time.Time `json:"editedAt,omitempty"`
-    
+
     // Author information
     Author      UniversalAuthor `json:"author"`
-    
+
     // Message metadata
     MessageType string `json:"messageType"` // "text", "image", "file", "system", etc.
     Platform    string `json:"platform"`    // "discord", "telegram", "whatsapp", "slack", etc.
-    
+
     // Rich content
     Attachments []UniversalAttachment `json:"attachments,omitempty"`
     Mentions    []UniversalMention    `json:"mentions,omitempty"`
     Reactions   []UniversalReaction   `json:"reactions,omitempty"`
-    
+
     // Thread/reply information
     ReplyToID   *string `json:"replyToId,omitempty"`
     ThreadID    *string `json:"threadId,omitempty"`
-    
+
     // Quote information for Discord replies
     QuotedMessage *QuotedMessage `json:"quotedMessage,omitempty"`
-    
+
     // Platform-specific data (stored as JSON for flexibility)
     PlatformData map[string]interface{} `json:"platformData,omitempty"`
-    
+
     // Message state
     IsDeleted   bool `json:"isDeleted"`
     IsPinned    bool `json:"isPinned"`
@@ -87,7 +88,7 @@ type UniversalAuthor struct {
     DisplayName string  `json:"displayName"`
     AvatarURL   *string `json:"avatarUrl,omitempty"`
     IsBot       bool    `json:"isBot"`
-    
+
     // Platform-specific author data
     PlatformData map[string]interface{} `json:"platformData,omitempty"`
 }
@@ -111,6 +112,13 @@ type UniversalReaction struct {
     Emoji   string   `json:"emoji"`
     Count   int      `json:"count"`
     UserIDs []string `json:"userIds"`
+}
+
+type DiscordAttachment struct {
+    ID            string `json:"id"`
+    URL           string `json:"url"`
+    FileName      string `json:"fileName"`
+    FileSizeBytes int64  `json:"fileSizeBytes"`
 }
 
 // Updated Discord message structures to match the JSON format
@@ -179,8 +187,34 @@ type BulkInsertData struct {
     DiscordMessages map[string]DiscordMessage
 }
 
+// Helper function to read and encode image as base64
+func encodeImageToBase64(imagePath string) (string, error) {
+    imageData, err := ioutil.ReadFile(imagePath)
+    if err != nil {
+        return "", fmt.Errorf("failed to read image file %s: %w", imagePath, err)
+    }
+
+    // Determine MIME type based on file extension
+    ext := strings.ToLower(filepath.Ext(imagePath))
+    var mimeType string
+    switch ext {
+		case ".jpg":
+        mimeType = "image/jpg"
+			case ".jpeg":
+        mimeType = "image/jpeg"
+    case ".png":
+        mimeType = "image/png"
+    case ".gif":
+        mimeType = "image/gif"
+    default:
+        mimeType = "image/jpg" // default fallback
+    }
+
+    return fmt.Sprintf("data:%s;base64,%s", mimeType, base64.StdEncoding.EncodeToString(imageData)), nil
+}
+
 // Platform-specific converters
-func ConvertDiscordMessage(discordMsg DiscordMessage, myUsername string, discordToSharedMsgID map[string][]byte, discordMessages map[string]DiscordMessage) UniversalMessage {
+func ConvertDiscordMessage(discordMsg DiscordMessage, myUsername string, discordToSharedMsgID map[string][]byte, discordMessages map[string]DiscordMessage, jsonDir string) UniversalMessage {
     timestamp, _ := time.Parse(time.RFC3339, discordMsg.Timestamp)
     var editedAt *time.Time
     if discordMsg.TimestampEdited != nil {
@@ -188,7 +222,24 @@ func ConvertDiscordMessage(discordMsg DiscordMessage, myUsername string, discord
             editedAt = &parsed
         }
     }
-    
+
+    // Handle attachments
+    var attachments []UniversalAttachment
+    var messageType string = "text"
+    if len(discordMsg.Attachments) > 0 {
+        messageType = "image" // Assume first attachment determines type
+        for _, att := range discordMsg.Attachments {
+            if attMap, ok := att.(map[string]interface{}); ok {
+                attachments = append(attachments, UniversalAttachment{
+                    ID:       fmt.Sprintf("%v", attMap["id"]),
+                    Filename: fmt.Sprintf("%v", attMap["fileName"]),
+                    URL:      fmt.Sprintf("%v", attMap["url"]),
+                    Size:     int64(attMap["fileSizeBytes"].(float64)),
+                })
+            }
+        }
+    }
+
     // Convert mentions
     var mentions []UniversalMention
     for _, mention := range discordMsg.Mentions {
@@ -199,7 +250,7 @@ func ConvertDiscordMessage(discordMsg DiscordMessage, myUsername string, discord
             Length:   len(mention.Name),
         })
     }
-    
+
     // Handle reply reference - use the mapping to get the correct shared_msg_id
     var replyToID *string
     var quotedMessage *QuotedMessage
@@ -209,12 +260,12 @@ func ConvertDiscordMessage(discordMsg DiscordMessage, myUsername string, discord
             // Convert shared_msg_id back to string for the universal format
             replyToIDStr := string(sharedMsgID)
             replyToID = &replyToIDStr
-            
+
             // Get the quoted message data
             if quotedDiscordMsg, exists := discordMessages[referencedDiscordID]; exists {
                 quotedTimestamp, _ := time.Parse(time.RFC3339, quotedDiscordMsg.Timestamp)
                 quotedIsSent := quotedDiscordMsg.Author.Name == myUsername
-                
+
                 quotedMessage = &QuotedMessage{
                     SharedMsgID: sharedMsgID,
                     SentAt:      quotedTimestamp,
@@ -228,22 +279,23 @@ func ConvertDiscordMessage(discordMsg DiscordMessage, myUsername string, discord
             replyToID = &referencedDiscordID
         }
     }
-    
+
     // Determine display name (prefer nickname, fallback to name)
     displayName := discordMsg.Author.Nickname
     if displayName == "" {
         displayName = discordMsg.Author.Name
     }
-    
+
     // Check if this message was sent by the specified user
     isSent := discordMsg.Author.Name == myUsername
-    
+
     return UniversalMessage{
         ID:            discordMsg.ID,
         Content:       discordMsg.Content,
         Timestamp:     timestamp,
         EditedAt:      editedAt,
-        MessageType:   strings.ToLower(discordMsg.Type),
+        MessageType:   messageType,
+        Attachments:   attachments,
         Platform:      "discord",
         QuotedMessage: quotedMessage,
         Author: UniversalAuthor{
@@ -313,27 +365,27 @@ func getTemplateRow(querier Querier, tableName string, idColumn string) (map[str
         return nil, err
     }
 
-    selectQuery := fmt.Sprintf("SELECT %s FROM %s WHERE %s = ?", 
+    selectQuery := fmt.Sprintf("SELECT %s FROM %s WHERE %s = ?",
         strings.Join(columns, ", "), tableName, idColumn)
-    
+
     row := querier.QueryRow(selectQuery, templateID)
-    
+
     values := make([]interface{}, len(columns))
     valuePtrs := make([]interface{}, len(columns))
     for i := range values {
         valuePtrs[i] = &values[i]
     }
-    
+
     err = row.Scan(valuePtrs...)
     if err != nil {
         return nil, err
     }
-    
+
     result := make(map[string]interface{})
     for i, col := range columns {
         result[col] = values[i]
     }
-    
+
     return result, nil
 }
 
@@ -349,7 +401,7 @@ func calculateChunkSize(numColumns int, maxParams int) int {
     return chunkSize
 }
 
-func bulkInsertMessages(tx *sql.Tx, data BulkInsertData) error {
+func bulkInsertMessages(tx *sql.Tx, data BulkInsertData, jsonDir string) error {
     // Get template row
     templateRow, err := getTemplateRow(tx, "messages", "message_id")
     if err != nil {
@@ -363,32 +415,75 @@ func bulkInsertMessages(tx *sql.Tx, data BulkInsertData) error {
 
     // Calculate safe chunk size
     chunkSize := calculateChunkSize(len(columns), 900)
-    
+
     // Process in chunks to avoid SQLite parameter limit
     for i := 0; i < len(data.Messages); i += chunkSize {
         end := i + chunkSize
         if end > len(data.Messages) {
             end = len(data.Messages)
         }
-        
+
         chunk := data.Messages[i:end]
-        
+
         // Build bulk insert query for this chunk
         placeholders := make([]string, len(chunk))
         args := make([]interface{}, 0, len(chunk)*len(columns))
 
         for j, msgData := range chunk {
             msg := msgData.Message
-            
+
             // Create message body with proper structure
             encodedMsgID := base64.StdEncoding.EncodeToString([]byte(msg.ID))
-            
+
+            var content map[string]interface{}
+            var fileInfo map[string]interface{}
+
+            // Handle image messages
+            if msg.MessageType == "image" && len(msg.Attachments) > 0 {
+                attachment := msg.Attachments[0] // Use first attachment
+                imagePath := filepath.Join(jsonDir, attachment.URL)
+
+                imageBase64, err := encodeImageToBase64(imagePath)
+                if err != nil {
+                    log.Printf("Warning: failed to encode image %s: %v", imagePath, err)
+                    // Fallback to text message
+                    content = map[string]interface{}{
+                        "text": msg.Content,
+                        "type": "text",
+                    }
+                } else {
+                    content = map[string]interface{}{
+                        "image": imageBase64,
+                        "text":  msg.Content,
+                        "type":  "image",
+                    }
+
+                    fileInfo = map[string]interface{}{
+                        "fileDescr": map[string]interface{}{
+                            "fileDescrComplete": false,
+                            "fileDescrPartNo":   0,
+                            "fileDescrText":     "",
+                        },
+                        "fileName": attachment.Filename,
+                        "fileSize": attachment.Size,
+                    }
+                }
+            } else {
+                // Regular text message
+                content = map[string]interface{}{
+                    "text": msg.Content,
+                    "type": "text",
+                }
+            }
+
             // Build params object with correct structure
             params := map[string]interface{}{
-                "content": map[string]interface{}{
-                    "text": msg.Content,
-                    "type": "text", // Always use "text" for the content type
-                },
+                "content": content,
+            }
+
+            // Add file info for images
+            if fileInfo != nil {
+                params["file"] = fileInfo
             }
 
             // Add quote structure if this is a reply
@@ -425,19 +520,20 @@ func bulkInsertMessages(tx *sql.Tx, data BulkInsertData) error {
             }
 
             overrideFields := map[string]interface{}{
-                "message_id":    msgData.MessageID,
-                "shared_msg_id": msgData.SharedMsgID,
-                "msg_body":      msgBodyBytes,
-                "msg_sent":      msgSent,
-                "created_at":    msg.Timestamp.Format("2006-01-02 15:04:05"),
-                "updated_at":    msg.Timestamp.Format("2006-01-02 15:04:05"),
+                "message_id":     msgData.MessageID,
+                "chat_msg_event": "x.msg.new",
+                "shared_msg_id":  msgData.SharedMsgID,
+                "msg_body":       msgBodyBytes,
+                "msg_sent":       msgSent,
+                "created_at":     msg.Timestamp.Format("2006-01-02 15:04:05"),
+                "updated_at":     msg.Timestamp.Format("2006-01-02 15:04:05"),
             }
 
-						if msgSent == 1 {
-							overrideFields["shared_msg_id_user"] = 1
-						} else {
-							overrideFields["shared_msg_id_user"] = nil
-						}
+            if msgSent == 1 {
+                overrideFields["shared_msg_id_user"] = 1
+            } else {
+                overrideFields["shared_msg_id_user"] = nil
+            }
 
             // Build row values
             rowValues := make([]interface{}, len(columns))
@@ -461,11 +557,11 @@ func bulkInsertMessages(tx *sql.Tx, data BulkInsertData) error {
             return fmt.Errorf("failed to execute chunk %d-%d: %w", i, end, err)
         }
     }
-    
+
     return nil
 }
 
-func bulkInsertChatItems(tx *sql.Tx, data BulkInsertData) error {
+func bulkInsertChatItems(tx *sql.Tx, data BulkInsertData, jsonDir string) error {
     templateRow, err := getTemplateRow(tx, "chat_items", "chat_item_id")
     if err != nil {
         return fmt.Errorf("failed to get template row: %w", err)
@@ -478,38 +574,67 @@ func bulkInsertChatItems(tx *sql.Tx, data BulkInsertData) error {
 
     // Calculate safe chunk size
     chunkSize := calculateChunkSize(len(columns), 900)
-    
+
     // Process in chunks
     for i := 0; i < len(data.Messages); i += chunkSize {
         end := i + chunkSize
         if end > len(data.Messages) {
             end = len(data.Messages)
         }
-        
+
         chunk := data.Messages[i:end]
-        
+
         placeholders := make([]string, len(chunk))
         args := make([]interface{}, 0, len(chunk)*len(columns))
 
         for j, msgData := range chunk {
             msg := msgData.Message
 
+            var itemSent int
             var itemContentTag string
             var itemStatus string
             if msg.IsSent {
+                itemSent = 1
                 itemContentTag = "sndMsgContent"
                 itemStatus = "snd_rcvd ok complete"
             } else {
+                itemSent = 0
                 itemContentTag = "rcvMsgContent"
                 itemStatus = "rcv_read"
             }
 
-            itemContent := map[string]interface{}{
-                itemContentTag: map[string]interface{}{
-                    "msgContent": map[string]interface{}{
+            var msgContent map[string]interface{}
+
+            // Handle image messages
+            if msg.MessageType == "image" && len(msg.Attachments) > 0 {
+                attachment := msg.Attachments[0]
+                imagePath := filepath.Join(jsonDir, attachment.URL)
+
+                imageBase64, err := encodeImageToBase64(imagePath)
+                if err != nil {
+                    log.Printf("Warning: failed to encode image %s: %v", imagePath, err)
+                    // Fallback to text content
+                    msgContent = map[string]interface{}{
                         "type": "text",
                         "text": msg.Content,
-                    },
+                    }
+                } else {
+                    msgContent = map[string]interface{}{
+                        "type":  "image",
+                        "text":  msg.Content,
+                        "image": imageBase64,
+                    }
+                }
+            } else {
+                msgContent = map[string]interface{}{
+                    "type": "text",
+                    "text": msg.Content,
+                }
+            }
+
+            itemContent := map[string]interface{}{
+                itemContentTag: map[string]interface{}{
+                    "msgContent": msgContent,
                 },
             }
 
@@ -525,7 +650,9 @@ func bulkInsertChatItems(tx *sql.Tx, data BulkInsertData) error {
                 "item_content":      string(itemContentBytes),
                 "item_text":         msg.Content,
                 "item_content_tag":  itemContentTag,
+                "item_sent":         itemSent,
                 "item_status":       itemStatus,
+                // "via_proxy":         nil,
                 "item_ts":           msg.Timestamp.Format("2006-01-02 15:04:05"),
                 "created_at":        msg.Timestamp.Format("2006-01-02 15:04:05"),
                 "updated_at":        msg.Timestamp.Format("2006-01-02 15:04:05"),
@@ -547,7 +674,7 @@ func bulkInsertChatItems(tx *sql.Tx, data BulkInsertData) error {
                     quotedSent = 1
                 }
 
-                overrideFields["quoted_shared_msg_id"] = string(msg.QuotedMessage.SharedMsgID)
+                overrideFields["quoted_shared_msg_id"] = msg.QuotedMessage.SharedMsgID
                 overrideFields["quoted_sent_at"] = msg.QuotedMessage.SentAt.Format("2006-01-02 15:04:05")
                 overrideFields["quoted_content"] = string(quotedContentBytes)
                 overrideFields["quoted_sent"] = quotedSent
@@ -556,13 +683,7 @@ func bulkInsertChatItems(tx *sql.Tx, data BulkInsertData) error {
                 overrideFields["quoted_sent_at"] = nil
                 overrideFields["quoted_content"] = nil
                 overrideFields["quoted_sent"] = nil
-						}
-
-						// FIXME: Need to quoted replys working.
-						overrideFields["quoted_shared_msg_id"] = nil
-						overrideFields["quoted_sent_at"] = nil
-						overrideFields["quoted_content"] = nil
-						overrideFields["quoted_sent"] = nil
+            }
 
             rowValues := make([]interface{}, len(columns))
             for k, col := range columns {
@@ -585,7 +706,7 @@ func bulkInsertChatItems(tx *sql.Tx, data BulkInsertData) error {
             return fmt.Errorf("failed to execute chunk %d-%d: %w", i, end, err)
         }
     }
-    
+
     return nil
 }
 
@@ -598,26 +719,26 @@ func bulkInsertChatItemMessages(tx *sql.Tx, data BulkInsertData) error {
     if err != nil {
         return err
     }
-    
+
     // Get next available rowid
     var nextRowID int
     err = tx.QueryRow("SELECT COALESCE(MAX(rowid), 0) + 1 FROM chat_item_messages").Scan(&nextRowID)
     if err != nil {
         return fmt.Errorf("failed to get next rowid: %w", err)
     }
-    
+
     // Calculate safe chunk size
     chunkSize := calculateChunkSize(len(columns), 900)
-    
+
     // Process in chunks
     for i := 0; i < len(data.Messages); i += chunkSize {
         end := i + chunkSize
         if end > len(data.Messages) {
             end = len(data.Messages)
         }
-        
+
         chunk := data.Messages[i:end]
-        
+
         placeholders := make([]string, len(chunk))
         args := make([]interface{}, 0, len(chunk)*len(columns))
         for j, msgData := range chunk {
@@ -647,7 +768,7 @@ func bulkInsertChatItemMessages(tx *sql.Tx, data BulkInsertData) error {
             return fmt.Errorf("failed to execute chunk %d-%d: %w", i, end, err)
         }
     }
-    
+
     return nil
 }
 
@@ -671,16 +792,16 @@ func bulkInsertMsgDeliveries(tx *sql.Tx, data BulkInsertData) error {
 
     // Calculate safe chunk size
     chunkSize := calculateChunkSize(len(columns), 900)
-    
+
     // Process in chunks
     for i := 0; i < len(data.Messages); i += chunkSize {
         end := i + chunkSize
         if end > len(data.Messages) {
             end = len(data.Messages)
         }
-        
+
         chunk := data.Messages[i:end]
-        
+
         placeholders := make([]string, len(chunk))
         args := make([]interface{}, 0, len(chunk)*len(columns))
 
@@ -726,11 +847,11 @@ func bulkInsertMsgDeliveries(tx *sql.Tx, data BulkInsertData) error {
             return fmt.Errorf("failed to execute chunk %d-%d: %w", i, end, err)
         }
     }
-    
+
     return nil
 }
 
-func bulkInsertUniversalMessages(db *sql.DB, messages []UniversalMessage, startMessageID int) error {
+func bulkInsertUniversalMessages(db *sql.DB, messages []UniversalMessage, startMessageID int, jsonDir string) error {
     // Start transaction
     tx, err := db.Begin()
     if err != nil {
@@ -771,13 +892,13 @@ func bulkInsertUniversalMessages(db *sql.DB, messages []UniversalMessage, startM
 
     // Perform bulk inserts
     fmt.Printf("Inserting %d messages...\n", len(messages))
-    
-    err = bulkInsertMessages(tx, bulkData)
+
+    err = bulkInsertMessages(tx, bulkData, jsonDir)
     if err != nil {
         return fmt.Errorf("failed to bulk insert messages: %w", err)
     }
 
-    err = bulkInsertChatItems(tx, bulkData)
+    err = bulkInsertChatItems(tx, bulkData, jsonDir)
     if err != nil {
         return fmt.Errorf("failed to bulk insert chat items: %w", err)
     }
@@ -851,7 +972,7 @@ func main() {
     fmt.Printf("Loaded export for channel: %s (%d messages)\n", export.Channel.Name, len(export.Messages))
     fmt.Printf("Your username: %s\n", myUsername)
     fmt.Printf("Batch size: %d\n\n", batchSize)
-    
+
     // Connect to database
     dsn := fmt.Sprintf("%s?_key=%s&_busy_timeout=30000", dbPath, password)
     db, err := sql.Open("sqlite3", dsn)
@@ -875,6 +996,10 @@ func main() {
 
     fmt.Printf("Starting message ID: %d\n", startMessageID)
 
+    // Get directory containing the JSON file for relative path resolution
+    jsonDir := filepath.Dir(jsonFilePath)
+    fmt.Printf("JSON directory: %s\n", jsonDir)
+
     // First pass: Build Discord ID to shared_msg_id mapping for the entire dataset
     fmt.Println("Building message ID mapping...")
     discordToSharedMsgID := make(map[string][]byte)
@@ -883,7 +1008,7 @@ func main() {
         sharedMsgID := []byte(discordMsg.ID)
         discordToSharedMsgID[discordMsg.ID] = sharedMsgID
         discordMessages[discordMsg.ID] = discordMsg
-        
+
         // For debugging: print first few mappings
         if i < 5 {
             fmt.Printf("Mapping Discord ID %s to shared_msg_id %s\n", discordMsg.ID, string(sharedMsgID))
@@ -895,7 +1020,7 @@ func main() {
     universalMessages := make([]UniversalMessage, 0, len(export.Messages))
 
     for _, discordMsg := range export.Messages {
-        universalMsg := ConvertDiscordMessage(discordMsg, myUsername, discordToSharedMsgID, discordMessages)
+        universalMsg := ConvertDiscordMessage(discordMsg, myUsername, discordToSharedMsgID, discordMessages, jsonDir)
         universalMessages = append(universalMessages, universalMsg)
     }
 
@@ -915,7 +1040,7 @@ func main() {
 
         fmt.Printf("Processing batch %d-%d...\n", i+1, end)
 
-        err = bulkInsertUniversalMessages(db, batch, batchStartID)
+        err = bulkInsertUniversalMessages(db, batch, batchStartID, jsonDir)
         if err != nil {
             log.Fatalf("Failed to insert batch %d-%d: %v", i+1, end, err)
         }
