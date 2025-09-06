@@ -227,16 +227,35 @@ func ConvertDiscordMessage(discordMsg DiscordMessage, myUsername string, discord
     var attachments []UniversalAttachment
     var messageType string = "text"
     if len(discordMsg.Attachments) > 0 {
-        messageType = "image" // Assume first attachment determines type
         for _, att := range discordMsg.Attachments {
             if attMap, ok := att.(map[string]interface{}); ok {
+                filename := fmt.Sprintf("%v", attMap["fileName"])
+                
+                // Determine message type based on file extension
+                ext := strings.ToLower(filepath.Ext(filename))
+                switch ext {
+                case ".jpg", ".jpeg", ".png", ".gif", ".webp":
+                    messageType = "image"
+                case ".mp4", ".webm", ".mov", ".avi":
+                    messageType = "video"
+                case ".mp3", ".wav", ".m4a", ".ogg":
+                    messageType = "voice"
+                default:
+                    messageType = "file"
+                }
+                
                 attachments = append(attachments, UniversalAttachment{
                     ID:       fmt.Sprintf("%v", attMap["id"]),
-                    Filename: fmt.Sprintf("%v", attMap["fileName"]),
+                    Filename: filename,
                     URL:      fmt.Sprintf("%v", attMap["url"]),
                     Size:     int64(attMap["fileSizeBytes"].(float64)),
                 })
             }
+        }
+        
+        // If no message type was set (no attachments processed), default to file
+        if messageType == "text" && len(attachments) > 0 {
+            messageType = "file"
         }
     }
 
@@ -353,11 +372,16 @@ func getTableColumns(querier Querier, tableName string) ([]string, error) {
 }
 
 func getTemplateRow(querier Querier, tableName string, idColumn string) (map[string]interface{}, error) {
-    var templateID int
+    var templateID sql.NullInt64
     query := fmt.Sprintf("SELECT MAX(%s) FROM %s", idColumn, tableName)
     err := querier.QueryRow(query).Scan(&templateID)
     if err != nil {
         return nil, fmt.Errorf("failed to get template %s: %w", idColumn, err)
+    }
+
+    // If database is empty (MAX returns NULL), return empty map
+    if !templateID.Valid {
+        return make(map[string]interface{}), nil
     }
 
     columns, err := getTableColumns(querier, tableName)
@@ -368,7 +392,7 @@ func getTemplateRow(querier Querier, tableName string, idColumn string) (map[str
     selectQuery := fmt.Sprintf("SELECT %s FROM %s WHERE %s = ?",
         strings.Join(columns, ", "), tableName, idColumn)
 
-    row := querier.QueryRow(selectQuery, templateID)
+    row := querier.QueryRow(selectQuery, templateID.Int64)
 
     values := make([]interface{}, len(columns))
     valuePtrs := make([]interface{}, len(columns))
@@ -438,26 +462,77 @@ func bulkInsertMessages(tx *sql.Tx, data BulkInsertData, jsonDir string) error {
             var content map[string]interface{}
             var fileInfo map[string]interface{}
 
-            // Handle image messages
-            if msg.MessageType == "image" && len(msg.Attachments) > 0 {
+            // Handle different message types with attachments
+            if len(msg.Attachments) > 0 {
                 attachment := msg.Attachments[0] // Use first attachment
-                imagePath := filepath.Join(jsonDir, attachment.URL)
-
-                imageBase64, err := encodeImageToBase64(imagePath)
-                if err != nil {
-                    log.Printf("Warning: failed to encode image %s: %v", imagePath, err)
-                    // Fallback to text message
+                
+                switch msg.MessageType {
+                case "image":
+                    imagePath := filepath.Join(jsonDir, attachment.URL)
+                    imageBase64, err := encodeImageToBase64(imagePath)
+                    if err != nil {
+                        log.Printf("Warning: failed to encode image %s: %v", imagePath, err)
+                        // Fallback to text with file info
+                        content = map[string]interface{}{
+                            "text": fmt.Sprintf("[Image: %s]%s", attachment.Filename, 
+                                func() string { if msg.Content != "" { return "\n" + msg.Content }; return "" }()),
+                            "type": "text",
+                        }
+                    } else {
+                        content = map[string]interface{}{
+                            "image": imageBase64,
+                            "text":  msg.Content,
+                            "type":  "image",
+                        }
+                        fileInfo = map[string]interface{}{
+                            "fileDescr": map[string]interface{}{
+                                "fileDescrComplete": false,
+                                "fileDescrPartNo":   0,
+                                "fileDescrText":     "",
+                            },
+                            "fileName": attachment.Filename,
+                            "fileSize": attachment.Size,
+                        }
+                    }
+                    
+                case "video":
+                    // For videos, create file attachment with text content
                     content = map[string]interface{}{
                         "text": msg.Content,
-                        "type": "text",
+                        "type": "file",
                     }
-                } else {
+                    fileInfo = map[string]interface{}{
+                        "fileDescr": map[string]interface{}{
+                            "fileDescrComplete": false,
+                            "fileDescrPartNo":   0,
+                            "fileDescrText":     "",
+                        },
+                        "fileName": attachment.Filename,
+                        "fileSize": attachment.Size,
+                    }
+                    
+                case "voice":
+                    // For voice messages, create file attachment
                     content = map[string]interface{}{
-                        "image": imageBase64,
-                        "text":  msg.Content,
-                        "type":  "image",
+                        "text": msg.Content,
+                        "type": "file",
                     }
-
+                    fileInfo = map[string]interface{}{
+                        "fileDescr": map[string]interface{}{
+                            "fileDescrComplete": false,
+                            "fileDescrPartNo":   0,
+                            "fileDescrText":     "",
+                        },
+                        "fileName": attachment.Filename,
+                        "fileSize": attachment.Size,
+                    }
+                    
+                default: // "file" or unknown
+                    // Generic file attachment
+                    content = map[string]interface{}{
+                        "text": msg.Content,
+                        "type": "file",
+                    }
                     fileInfo = map[string]interface{}{
                         "fileDescr": map[string]interface{}{
                             "fileDescrComplete": false,
@@ -540,8 +615,11 @@ func bulkInsertMessages(tx *sql.Tx, data BulkInsertData, jsonDir string) error {
             for k, col := range columns {
                 if val, override := overrideFields[col]; override {
                     rowValues[k] = val
-                } else {
+                } else if templateRow != nil && len(templateRow) > 0 {
                     rowValues[k] = templateRow[col]
+                } else {
+                    // Default values for empty database
+                    rowValues[k] = nil
                 }
             }
 
@@ -589,6 +667,16 @@ func bulkInsertChatItems(tx *sql.Tx, data BulkInsertData, jsonDir string) error 
 
         for j, msgData := range chunk {
             msg := msgData.Message
+            
+            // Handle file attachments for non-image files
+            if len(msg.Attachments) > 0 && msg.MessageType != "image" {
+                attachment := msg.Attachments[0]
+                _, err := insertFileAttachment(tx, attachment, msgData.ChatItemID, msg.IsSent, jsonDir)
+                if err != nil {
+                    log.Printf("Warning: failed to create file attachment for %s: %v", attachment.Filename, err)
+                    // Continue without file attachment
+                }
+            }
 
             var itemSent int
             var itemContentTag string
@@ -605,24 +693,49 @@ func bulkInsertChatItems(tx *sql.Tx, data BulkInsertData, jsonDir string) error 
 
             var msgContent map[string]interface{}
 
-            // Handle image messages
-            if msg.MessageType == "image" && len(msg.Attachments) > 0 {
+            // Handle different message types with attachments
+            if len(msg.Attachments) > 0 {
                 attachment := msg.Attachments[0]
-                imagePath := filepath.Join(jsonDir, attachment.URL)
-
-                imageBase64, err := encodeImageToBase64(imagePath)
-                if err != nil {
-                    log.Printf("Warning: failed to encode image %s: %v", imagePath, err)
-                    // Fallback to text content
+                
+                switch msg.MessageType {
+                case "image":
+                    imagePath := filepath.Join(jsonDir, attachment.URL)
+                    imageBase64, err := encodeImageToBase64(imagePath)
+                    if err != nil {
+                        log.Printf("Warning: failed to encode image %s: %v", imagePath, err)
+                        // Fallback to text with file info
+                        msgContent = map[string]interface{}{
+                            "type": "text",
+                            "text": fmt.Sprintf("[Image: %s]%s", attachment.Filename,
+                                func() string { if msg.Content != "" { return "\n" + msg.Content }; return "" }()),
+                        }
+                    } else {
+                        msgContent = map[string]interface{}{
+                            "type":  "image",
+                            "text":  msg.Content,
+                            "image": imageBase64,
+                        }
+                    }
+                    
+                case "video":
+                    // For videos, use file type
                     msgContent = map[string]interface{}{
-                        "type": "text",
+                        "type": "file",
                         "text": msg.Content,
                     }
-                } else {
+                    
+                case "voice":
+                    // For voice messages, use file type
                     msgContent = map[string]interface{}{
-                        "type":  "image",
-                        "text":  msg.Content,
-                        "image": imageBase64,
+                        "type": "file",
+                        "text": msg.Content,
+                    }
+                    
+                default: // "file" or unknown
+                    // Generic file attachment
+                    msgContent = map[string]interface{}{
+                        "type": "file",
+                        "text": msg.Content,
                     }
                 }
             } else {
@@ -644,18 +757,24 @@ func bulkInsertChatItems(tx *sql.Tx, data BulkInsertData, jsonDir string) error 
             }
 
             overrideFields := map[string]interface{}{
-                "chat_item_id":      msgData.ChatItemID,
-                "created_by_msg_id": msgData.MessageID,
-                "shared_msg_id":     msgData.SharedMsgID,
-                "item_content":      string(itemContentBytes),
-                "item_text":         msg.Content,
-                "item_content_tag":  itemContentTag,
-                "item_sent":         itemSent,
-                "item_status":       itemStatus,
+                "chat_item_id":       msgData.ChatItemID,
+                "user_id":            1, // Use the available user ID
+                "contact_id":         4, // Associate with specified contact
+                "created_by_msg_id":  msgData.MessageID,
+                "shared_msg_id":      msgData.SharedMsgID,
+                "item_content":       string(itemContentBytes),
+                "item_text":          msg.Content,
+                "item_content_tag":   itemContentTag,
+                "item_sent":          itemSent,
+                "item_status":        itemStatus,
+                "item_deleted":       0, // Not deleted
+                "include_in_history": 1, // Include in history
+                "user_mention":       0, // Not a mention
+                "show_group_as_sender": 0, // Not a group message
                 // "via_proxy":         nil,
-                "item_ts":           msg.Timestamp.Format("2006-01-02 15:04:05"),
-                "created_at":        msg.Timestamp.Format("2006-01-02 15:04:05"),
-                "updated_at":        msg.Timestamp.Format("2006-01-02 15:04:05"),
+                "item_ts":            msg.Timestamp.Format("2006-01-02 15:04:05"),
+                "created_at":         msg.Timestamp.Format("2006-01-02 15:04:05"),
+                "updated_at":         msg.Timestamp.Format("2006-01-02 15:04:05"),
             }
 
             // Handle quoted message fields for Discord replies
@@ -689,8 +808,11 @@ func bulkInsertChatItems(tx *sql.Tx, data BulkInsertData, jsonDir string) error 
             for k, col := range columns {
                 if val, override := overrideFields[col]; override {
                     rowValues[k] = val
-                } else {
+                } else if templateRow != nil && len(templateRow) > 0 {
                     rowValues[k] = templateRow[col]
+                } else {
+                    // Default values for empty database
+                    rowValues[k] = nil
                 }
             }
 
@@ -754,8 +876,11 @@ func bulkInsertChatItemMessages(tx *sql.Tx, data BulkInsertData) error {
             for k, col := range columns {
                 if val, override := overrideFields[col]; override {
                     rowValues[k] = val
-                } else {
+                } else if templateRow != nil && len(templateRow) > 0 {
                     rowValues[k] = templateRow[col]
+                } else {
+                    // Default values for empty database
+                    rowValues[k] = nil
                 }
             }
             placeholders[j] = "(" + strings.Repeat("?,", len(columns)-1) + "?)"
@@ -818,6 +943,7 @@ func bulkInsertMsgDeliveries(tx *sql.Tx, data BulkInsertData) error {
             overrideFields := map[string]interface{}{
                 "msg_delivery_id": msgData.MessageID,
                 "message_id":      msgData.MessageID,
+                "connection_id":   1, // Use first available connection ID
                 "agent_msg_id":    maxAgentMsgID + 1 + i + j,
                 "agent_msg_meta":  nil,
                 "delivery_status": itemStatus,
@@ -830,8 +956,11 @@ func bulkInsertMsgDeliveries(tx *sql.Tx, data BulkInsertData) error {
             for k, col := range columns {
                 if val, override := overrideFields[col]; override {
                     rowValues[k] = val
-                } else {
+                } else if templateRow != nil && len(templateRow) > 0 {
                     rowValues[k] = templateRow[col]
+                } else {
+                    // Default values for empty database
+                    rowValues[k] = nil
                 }
             }
 
@@ -849,6 +978,162 @@ func bulkInsertMsgDeliveries(tx *sql.Tx, data BulkInsertData) error {
     }
 
     return nil
+}
+
+// Helper function to insert file attachment and return file_id
+func insertFileAttachment(tx *sql.Tx, attachment UniversalAttachment, chatItemID int, isSent bool, jsonDir string) (int, error) {
+    filePath := filepath.Join(jsonDir, attachment.URL)
+    
+    // Check if file exists
+    if _, err := os.Stat(filePath); os.IsNotExist(err) {
+        return 0, fmt.Errorf("file not found: %s", filePath)
+    }
+    
+    // Get template file row for default values
+    templateRow, err := getTemplateRow(tx, "files", "file_id")
+    if err != nil {
+        return 0, fmt.Errorf("failed to get template file row: %w", err)
+    }
+    
+    // Get next file_id
+    var nextFileID int
+    err = tx.QueryRow("SELECT COALESCE(MAX(file_id), 0) + 1 FROM files").Scan(&nextFileID)
+    if err != nil {
+        return 0, fmt.Errorf("failed to get next file_id: %w", err)
+    }
+    
+    // Insert into files table
+    columns, err := getTableColumns(tx, "files")
+    if err != nil {
+        return 0, err
+    }
+    
+    overrideFields := map[string]interface{}{
+        "file_id":        nextFileID,
+        "contact_id":     4, // Associate with specified contact
+        "file_name":      attachment.Filename,
+        "file_path":      filePath,
+        "file_size":      attachment.Size,
+        "chunk_size":     16384, // Standard chunk size
+        "user_id":        1, // Use available user ID
+        "chat_item_id":   chatItemID,
+        "ci_file_status": func() string {
+            if isSent {
+                return "snd_complete"
+            }
+            return "rcv_complete"
+        }(),
+        "created_at":     time.Now().Format("2006-01-02 15:04:05"),
+        "updated_at":     time.Now().Format("2006-01-02 15:04:05"),
+    }
+    
+    rowValues := make([]interface{}, len(columns))
+    for i, col := range columns {
+        if val, override := overrideFields[col]; override {
+            rowValues[i] = val
+        } else if templateRow != nil && len(templateRow) > 0 {
+            rowValues[i] = templateRow[col]
+        } else {
+            rowValues[i] = nil
+        }
+    }
+    
+    placeholders := "(" + strings.Repeat("?,", len(columns)-1) + "?)"
+    query := fmt.Sprintf("INSERT INTO files (%s) VALUES %s",
+        strings.Join(columns, ", "), placeholders)
+    
+    _, err = tx.Exec(query, rowValues...)
+    if err != nil {
+        return 0, fmt.Errorf("failed to insert file: %w", err)
+    }
+    
+    // Insert into snd_files or rcv_files table
+    if isSent {
+        err = insertSndFile(tx, nextFileID)
+    } else {
+        err = insertRcvFile(tx, nextFileID)
+    }
+    if err != nil {
+        return 0, fmt.Errorf("failed to insert file transfer record: %w", err)
+    }
+    
+    return nextFileID, nil
+}
+
+func insertSndFile(tx *sql.Tx, fileID int) error {
+    templateRow, err := getTemplateRow(tx, "snd_files", "file_id")
+    if err != nil {
+        return err
+    }
+    
+    columns, err := getTableColumns(tx, "snd_files")
+    if err != nil {
+        return err
+    }
+    
+    overrideFields := map[string]interface{}{
+        "file_id":      fileID,
+        "connection_id": 1, // Use available connection
+        "file_status":   "complete",
+        "created_at":    time.Now().Format("2006-01-02 15:04:05"),
+        "updated_at":    time.Now().Format("2006-01-02 15:04:05"),
+    }
+    
+    rowValues := make([]interface{}, len(columns))
+    for i, col := range columns {
+        if val, override := overrideFields[col]; override {
+            rowValues[i] = val
+        } else if templateRow != nil && len(templateRow) > 0 {
+            rowValues[i] = templateRow[col]
+        } else {
+            rowValues[i] = nil
+        }
+    }
+    
+    placeholders := "(" + strings.Repeat("?,", len(columns)-1) + "?)"
+    query := fmt.Sprintf("INSERT INTO snd_files (%s) VALUES %s",
+        strings.Join(columns, ", "), placeholders)
+    
+    _, err = tx.Exec(query, rowValues...)
+    return err
+}
+
+func insertRcvFile(tx *sql.Tx, fileID int) error {
+    templateRow, err := getTemplateRow(tx, "rcv_files", "file_id")
+    if err != nil {
+        return err
+    }
+    
+    columns, err := getTableColumns(tx, "rcv_files")
+    if err != nil {
+        return err
+    }
+    
+    overrideFields := map[string]interface{}{
+        "file_id":                fileID,
+        "file_status":            "complete",
+        "user_approved_relays":   0, // Set to 0 for imported files
+        "created_at":             time.Now().Format("2006-01-02 15:04:05"),
+        "updated_at":             time.Now().Format("2006-01-02 15:04:05"),
+    }
+    
+    rowValues := make([]interface{}, len(columns))
+    for i, col := range columns {
+        if val, override := overrideFields[col]; override {
+            rowValues[i] = val
+        } else if templateRow != nil && len(templateRow) > 0 {
+            rowValues[i] = templateRow[col]
+        } else {
+            rowValues[i] = nil
+        }
+    }
+    
+    placeholders := "(" + strings.Repeat("?,", len(columns)-1) + "?)"
+    query := fmt.Sprintf("INSERT INTO rcv_files (%s) VALUES %s",
+        strings.Join(columns, ", "), placeholders)
+    
+    _, err = tx.Exec(query, rowValues...)
+    return err
 }
 
 func bulkInsertUniversalMessages(db *sql.DB, messages []UniversalMessage, startMessageID int, jsonDir string) error {
