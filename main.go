@@ -228,8 +228,7 @@ func generateVideoThumbnail(videoPath string) (string, int, error) {
     thumbnailPath := filepath.Join(tempDir, fmt.Sprintf("thumb_%d.jpg", os.Getpid()))
     
     // Get video duration first
-    durationCmd := exec.Command("nix-shell", "-p", "ffmpeg", "--command",
-        fmt.Sprintf("ffprobe -v quiet -show_entries format=duration -of csv=p=0 '%s'", videoPath))
+    durationCmd := exec.Command("ffprobe", "-v", "quiet", "-show_entries", "format=duration", "-of", "csv=p=0", videoPath)
     durationOutput, err := durationCmd.Output()
     if err != nil {
         return "", 0, fmt.Errorf("failed to get video duration: %w", err)
@@ -248,15 +247,13 @@ func generateVideoThumbnail(videoPath string) (string, int, error) {
         duration = 86 // Default fallback duration
     }
     
-    // Use nix-shell with ffmpeg to extract thumbnail at 1 second mark
-    cmd := exec.Command("nix-shell", "-p", "ffmpeg", "--command", 
-        fmt.Sprintf("ffmpeg -i '%s' -ss 00:00:01 -vframes 1 -f image2 -s 320x240 '%s' -y", videoPath, thumbnailPath))
+    // Use ffmpeg to extract thumbnail at 1 second mark
+    cmd := exec.Command("ffmpeg", "-i", videoPath, "-ss", "00:00:01", "-vframes", "1", "-f", "image2", "-s", "320x240", thumbnailPath, "-y")
     cmd.Stderr = nil // Suppress ffmpeg output
     
     if err := cmd.Run(); err != nil {
         // If ffmpeg fails, try without seeking
-        cmd = exec.Command("nix-shell", "-p", "ffmpeg", "--command",
-            fmt.Sprintf("ffmpeg -i '%s' -vframes 1 -f image2 -s 320x240 '%s' -y", videoPath, thumbnailPath))
+        cmd = exec.Command("ffmpeg", "-i", videoPath, "-vframes", "1", "-f", "image2", "-s", "320x240", thumbnailPath, "-y")
         cmd.Stderr = nil
         if err := cmd.Run(); err != nil {
             return "", 0, fmt.Errorf("failed to generate thumbnail with ffmpeg: %w", err)

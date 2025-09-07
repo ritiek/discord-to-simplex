@@ -13,11 +13,13 @@ pkgs.buildGoModule {
     golangci-lint
     sqlcipher
     openssl
+    ffmpeg
   ];
 
   buildInputs = with pkgs; [
     sqlcipher
     openssl
+    ffmpeg
   ];
 
   checkPhase = ''
