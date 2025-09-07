@@ -282,7 +282,7 @@ func parseFloat(s string) float64 {
 }
 
 // Helper function to copy video file to SimpleX files directory
-func copyVideoToSimplexDir(sourcePath, filename string) error {
+func copyFileToSimplexDir(sourcePath, filename string) error {
     simplexFilesDir := "/home/ritiek/.local/share/simplex/simplex_v1_files"
     
     // Ensure SimpleX files directory exists
@@ -310,6 +310,11 @@ func copyVideoToSimplexDir(sourcePath, filename string) error {
     }
     
     return nil
+}
+
+// Deprecated: use copyFileToSimplexDir instead
+func copyVideoToSimplexDir(sourcePath, filename string) error {
+    return copyFileToSimplexDir(sourcePath, filename)
 }
 
 // Platform-specific converters
@@ -781,8 +786,8 @@ func bulkInsertChatItems(tx *sql.Tx, data BulkInsertData, jsonDir string) error 
         for j, msgData := range chunk {
             msg := msgData.Message
             
-            // Handle file attachments for non-image files
-            if len(msg.Attachments) > 0 && msg.MessageType != "image" {
+            // Handle file attachments for all message types with attachments
+            if len(msg.Attachments) > 0 {
                 attachment := msg.Attachments[0]
                 _, err := insertFileAttachment(tx, attachment, msgData.ChatItemID, msg.IsSent, jsonDir, msg.MessageType)
                 if err != nil {
@@ -1144,20 +1149,27 @@ func insertFileAttachment(tx *sql.Tx, attachment UniversalAttachment, chatItemID
         return 0, err
     }
     
-    // For videos, copy to SimpleX files directory and create as local files
-    if messageType == "video" {
-        err = copyVideoToSimplexDir(filePath, attachment.Filename)
-        if err != nil {
-            return 0, fmt.Errorf("failed to copy video to SimpleX directory: %w", err)
-        }
+    // Copy all files to SimpleX files directory so they are accessible/downloadable
+    err = copyFileToSimplexDir(filePath, attachment.Filename)
+    if err != nil {
+        return 0, fmt.Errorf("failed to copy file to SimpleX directory: %w", err)
     }
     
-    // For videos, create as local files without encryption (like native SimpleX videos)
+    // Set file status and protocol based on message type
     var fileStatus string
     var protocol string
     if messageType == "video" {
+        // Videos use local storage without transfer records
         fileStatus = "snd_stored"  // Local storage, not transferred
         protocol = "local"         // Local protocol, not smp/xftp
+    } else if messageType == "image" || messageType == "voice" {
+        // Images and voice use xftp protocol like original SimpleX files
+        if isSent {
+            fileStatus = "snd_complete"
+        } else {
+            fileStatus = "rcv_complete"
+        }
+        protocol = "xftp"
     } else {
         // For other files, use standard transfer status
         if isSent {
@@ -1206,9 +1218,10 @@ func insertFileAttachment(tx *sql.Tx, attachment UniversalAttachment, chatItemID
         return 0, fmt.Errorf("failed to insert file: %w", err)
     }
     
-    // For videos with local storage, don't create snd_files/rcv_files entries (like working video)
+    // Only videos don't need snd_files/rcv_files entries (they use local protocol)
+    // Images and voice messages need these entries (they use xftp protocol)
     if messageType != "video" {
-        // Insert into snd_files or rcv_files table for non-video files
+        // Insert into snd_files or rcv_files table
         if isSent {
             err = insertSndFile(tx, nextFileID)
         } else {
