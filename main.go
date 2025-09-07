@@ -317,6 +317,22 @@ func copyVideoToSimplexDir(sourcePath, filename string) error {
     return copyFileToSimplexDir(sourcePath, filename)
 }
 
+func getContactIDByName(db *sql.DB, contactName string) (int, error) {
+    var contactID int
+    query := `SELECT c.contact_id FROM contacts c 
+              LEFT JOIN contact_profiles cp ON c.contact_profile_id = cp.contact_profile_id 
+              WHERE c.deleted = 0 AND (c.local_display_name = ? OR cp.display_name = ?) 
+              LIMIT 1`
+    err := db.QueryRow(query, contactName, contactName).Scan(&contactID)
+    if err != nil {
+        if err == sql.ErrNoRows {
+            return 0, fmt.Errorf("contact '%s' not found", contactName)
+        }
+        return 0, fmt.Errorf("failed to lookup contact: %w", err)
+    }
+    return contactID, nil
+}
+
 // Platform-specific converters
 func ConvertDiscordMessage(discordMsg DiscordMessage, myUsername string, discordToSharedMsgID map[string][]byte, discordMessages map[string]DiscordMessage, jsonDir string) UniversalMessage {
     timestamp, _ := time.Parse(time.RFC3339, discordMsg.Timestamp)
@@ -529,7 +545,7 @@ func calculateChunkSize(numColumns int, maxParams int) int {
     return chunkSize
 }
 
-func bulkInsertMessages(tx *sql.Tx, data BulkInsertData, jsonDir string) error {
+func bulkInsertMessages(tx *sql.Tx, data BulkInsertData, jsonDir string, contactID int) error {
     // Get template row
     templateRow, err := getTemplateRow(tx, "messages", "message_id")
     if err != nil {
@@ -757,7 +773,7 @@ func bulkInsertMessages(tx *sql.Tx, data BulkInsertData, jsonDir string) error {
     return nil
 }
 
-func bulkInsertChatItems(tx *sql.Tx, data BulkInsertData, jsonDir string) error {
+func bulkInsertChatItems(tx *sql.Tx, data BulkInsertData, jsonDir string, contactID int) error {
     templateRow, err := getTemplateRow(tx, "chat_items", "chat_item_id")
     if err != nil {
         return fmt.Errorf("failed to get template row: %w", err)
@@ -789,7 +805,7 @@ func bulkInsertChatItems(tx *sql.Tx, data BulkInsertData, jsonDir string) error 
             // Handle file attachments for all message types with attachments
             if len(msg.Attachments) > 0 {
                 attachment := msg.Attachments[0]
-                _, err := insertFileAttachment(tx, attachment, msgData.ChatItemID, msg.IsSent, jsonDir, msg.MessageType)
+                _, err := insertFileAttachment(tx, attachment, msgData.ChatItemID, msg.IsSent, jsonDir, msg.MessageType, contactID)
                 if err != nil {
                     log.Printf("Warning: failed to create file attachment for %s: %v", attachment.Filename, err)
                     // Continue without file attachment
@@ -899,7 +915,7 @@ func bulkInsertChatItems(tx *sql.Tx, data BulkInsertData, jsonDir string) error 
             overrideFields := map[string]interface{}{
                 "chat_item_id":       msgData.ChatItemID,
                 "user_id":            1, // Use the available user ID
-                "contact_id":         4, // Associate with specified contact
+                "contact_id":         contactID, // Associate with specified contact
                 "created_by_msg_id":  msgData.MessageID,
                 "shared_msg_id":      msgData.SharedMsgID,
                 "item_content":       string(itemContentBytes),
@@ -1122,7 +1138,7 @@ func bulkInsertMsgDeliveries(tx *sql.Tx, data BulkInsertData) error {
 }
 
 // Helper function to insert file attachment and return file_id
-func insertFileAttachment(tx *sql.Tx, attachment UniversalAttachment, chatItemID int, isSent bool, jsonDir string, messageType string) (int, error) {
+func insertFileAttachment(tx *sql.Tx, attachment UniversalAttachment, chatItemID int, isSent bool, jsonDir string, messageType string, contactID int) (int, error) {
     filePath := filepath.Join(jsonDir, attachment.URL)
     
     // Check if file exists
@@ -1182,7 +1198,7 @@ func insertFileAttachment(tx *sql.Tx, attachment UniversalAttachment, chatItemID
     
     overrideFields := map[string]interface{}{
         "file_id":        nextFileID,
-        "contact_id":     4, // Associate with specified contact
+        "contact_id":     contactID, // Associate with specified contact
         "file_name":      attachment.Filename,
         "file_path":      attachment.Filename, // Store just filename like working video
         "file_size":      attachment.Size,
@@ -1319,7 +1335,7 @@ func insertRcvFile(tx *sql.Tx, fileID int) error {
     return err
 }
 
-func bulkInsertUniversalMessages(db *sql.DB, messages []UniversalMessage, startMessageID int, jsonDir string) error {
+func bulkInsertUniversalMessages(db *sql.DB, messages []UniversalMessage, startMessageID int, jsonDir string, contactID int) error {
     // Start transaction
     tx, err := db.Begin()
     if err != nil {
@@ -1361,12 +1377,12 @@ func bulkInsertUniversalMessages(db *sql.DB, messages []UniversalMessage, startM
     // Perform bulk inserts
     fmt.Printf("Inserting %d messages...\n", len(messages))
 
-    err = bulkInsertMessages(tx, bulkData, jsonDir)
+    err = bulkInsertMessages(tx, bulkData, jsonDir, contactID)
     if err != nil {
         return fmt.Errorf("failed to bulk insert messages: %w", err)
     }
 
-    err = bulkInsertChatItems(tx, bulkData, jsonDir)
+    err = bulkInsertChatItems(tx, bulkData, jsonDir, contactID)
     if err != nil {
         return fmt.Errorf("failed to bulk insert chat items: %w", err)
     }
@@ -1410,12 +1426,13 @@ func main() {
     var jsonFilePath string
     var myUsername string
     var dbPath string
-    var batchSize int
+    var contactName string
+    batchSize := 500 // Hardcoded batch size
 
     flag.StringVar(&jsonFilePath, "json", "", "Path to Discord JSON export file (required)")
     flag.StringVar(&myUsername, "me", "", "Your Discord username to identify sent messages (required)")
-    flag.StringVar(&dbPath, "db", "/home/ritiek/.local/share/simplex/simplex_v1_chat.db", "Path to SQLCipher database")
-    flag.IntVar(&batchSize, "batch", 5000, "Batch size for bulk inserts (default: 5000)")
+    flag.StringVar(&contactName, "contact", "", "SimpleX contact name to import messages to (required)")
+    flag.StringVar(&dbPath, "db", "", "Path to SQLCipher database (required)")
     flag.Parse()
 
     if jsonFilePath == "" {
@@ -1423,6 +1440,12 @@ func main() {
     }
     if myUsername == "" {
         log.Fatal("Username is required. Use -me flag.")
+    }
+    if contactName == "" {
+        log.Fatal("Contact name is required. Use -contact flag.")
+    }
+    if dbPath == "" {
+        log.Fatal("Database path is required. Use -db flag.")
     }
 
     password := os.Getenv("SQLCIPHER_KEY")
@@ -1454,6 +1477,13 @@ func main() {
     if err != nil {
         log.Fatalf("Failed to connect to database: %v", err)
     }
+
+    // Look up contact ID by name
+    contactID, err := getContactIDByName(db, contactName)
+    if err != nil {
+        log.Fatalf("Failed to find contact '%s': %v", contactName, err)
+    }
+    fmt.Printf("Contact: %s (ID: %d)\n", contactName, contactID)
 
     // Get starting message ID
     var startMessageID int
@@ -1508,7 +1538,7 @@ func main() {
 
         fmt.Printf("Processing batch %d-%d...\n", i+1, end)
 
-        err = bulkInsertUniversalMessages(db, batch, batchStartID, jsonDir)
+        err = bulkInsertUniversalMessages(db, batch, batchStartID, jsonDir, contactID)
         if err != nil {
             log.Fatalf("Failed to insert batch %d-%d: %v", i+1, end, err)
         }
