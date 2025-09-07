@@ -7,9 +7,12 @@ import (
     "path/filepath"
     "flag"
     "fmt"
+    "io"
     "io/ioutil"
     "log"
     "os"
+    "os/exec"
+    "strconv"
     "strings"
     "time"
 
@@ -211,6 +214,105 @@ func encodeImageToBase64(imagePath string) (string, error) {
     }
 
     return fmt.Sprintf("data:%s;base64,%s", mimeType, base64.StdEncoding.EncodeToString(imageData)), nil
+}
+
+// Function to generate video thumbnail using ffmpeg and get video duration
+func generateVideoThumbnail(videoPath string) (string, int, error) {
+    // Create temporary directory for thumbnail
+    tempDir := "/tmp/video_thumbnails"
+    if err := os.MkdirAll(tempDir, 0755); err != nil {
+        return "", 0, fmt.Errorf("failed to create temp directory: %w", err)
+    }
+    
+    // Generate unique thumbnail filename
+    thumbnailPath := filepath.Join(tempDir, fmt.Sprintf("thumb_%d.jpg", os.Getpid()))
+    
+    // Get video duration first
+    durationCmd := exec.Command("nix-shell", "-p", "ffmpeg", "--command",
+        fmt.Sprintf("ffprobe -v quiet -show_entries format=duration -of csv=p=0 '%s'", videoPath))
+    durationOutput, err := durationCmd.Output()
+    if err != nil {
+        return "", 0, fmt.Errorf("failed to get video duration: %w", err)
+    }
+    
+    // Parse duration (convert from float seconds to int)
+    var duration int
+    if len(durationOutput) > 0 {
+        durationStr := strings.TrimSpace(string(durationOutput))
+        if durationFloat := parseFloat(durationStr); durationFloat > 0 {
+            duration = int(durationFloat)
+        } else {
+            duration = 86 // Default fallback duration
+        }
+    } else {
+        duration = 86 // Default fallback duration
+    }
+    
+    // Use nix-shell with ffmpeg to extract thumbnail at 1 second mark
+    cmd := exec.Command("nix-shell", "-p", "ffmpeg", "--command", 
+        fmt.Sprintf("ffmpeg -i '%s' -ss 00:00:01 -vframes 1 -f image2 -s 320x240 '%s' -y", videoPath, thumbnailPath))
+    cmd.Stderr = nil // Suppress ffmpeg output
+    
+    if err := cmd.Run(); err != nil {
+        // If ffmpeg fails, try without seeking
+        cmd = exec.Command("nix-shell", "-p", "ffmpeg", "--command",
+            fmt.Sprintf("ffmpeg -i '%s' -vframes 1 -f image2 -s 320x240 '%s' -y", videoPath, thumbnailPath))
+        cmd.Stderr = nil
+        if err := cmd.Run(); err != nil {
+            return "", 0, fmt.Errorf("failed to generate thumbnail with ffmpeg: %w", err)
+        }
+    }
+    
+    // Read the thumbnail file
+    thumbnailData, err := ioutil.ReadFile(thumbnailPath)
+    if err != nil {
+        return "", 0, fmt.Errorf("failed to read thumbnail: %w", err)
+    }
+    
+    // Clean up temp file
+    os.Remove(thumbnailPath)
+    
+    // Return base64 encoded thumbnail and duration
+    return fmt.Sprintf("data:image/jpg;base64,%s", base64.StdEncoding.EncodeToString(thumbnailData)), duration, nil
+}
+
+// Helper function to parse float from string
+func parseFloat(s string) float64 {
+    if f, err := strconv.ParseFloat(s, 64); err == nil {
+        return f
+    }
+    return 0
+}
+
+// Helper function to copy video file to SimpleX files directory
+func copyVideoToSimplexDir(sourcePath, filename string) error {
+    simplexFilesDir := "/home/ritiek/.local/share/simplex/simplex_v1_files"
+    
+    // Ensure SimpleX files directory exists
+    if err := os.MkdirAll(simplexFilesDir, 0755); err != nil {
+        return fmt.Errorf("failed to create SimpleX files directory: %w", err)
+    }
+    
+    // Copy file
+    sourceFile, err := os.Open(sourcePath)
+    if err != nil {
+        return fmt.Errorf("failed to open source file: %w", err)
+    }
+    defer sourceFile.Close()
+    
+    destPath := filepath.Join(simplexFilesDir, filename)
+    destFile, err := os.Create(destPath)
+    if err != nil {
+        return fmt.Errorf("failed to create destination file: %w", err)
+    }
+    defer destFile.Close()
+    
+    _, err = io.Copy(destFile, sourceFile)
+    if err != nil {
+        return fmt.Errorf("failed to copy file: %w", err)
+    }
+    
+    return nil
 }
 
 // Platform-specific converters
@@ -496,10 +598,24 @@ func bulkInsertMessages(tx *sql.Tx, data BulkInsertData, jsonDir string) error {
                     }
                     
                 case "video":
-                    // For videos, create file attachment with text content
-                    content = map[string]interface{}{
-                        "text": msg.Content,
-                        "type": "file",
+                    // For videos, try to generate thumbnail and get duration
+                    videoPath := filepath.Join(jsonDir, attachment.URL)
+                    thumbnailBase64, duration, err := generateVideoThumbnail(videoPath)
+                    if err != nil {
+                        log.Printf("Warning: failed to generate video thumbnail for %s: %v", attachment.Filename, err)
+                        // Fallback to file type without thumbnail
+                        content = map[string]interface{}{
+                            "type": "file",
+                            "text": msg.Content,
+                        }
+                    } else {
+                        // Success - create video content with thumbnail and duration
+                        content = map[string]interface{}{
+                            "type":     "video",
+                            "text":     msg.Content,
+                            "image":    thumbnailBase64,
+                            "duration": duration,
+                        }
                     }
                     fileInfo = map[string]interface{}{
                         "fileDescr": map[string]interface{}{
@@ -671,7 +787,7 @@ func bulkInsertChatItems(tx *sql.Tx, data BulkInsertData, jsonDir string) error 
             // Handle file attachments for non-image files
             if len(msg.Attachments) > 0 && msg.MessageType != "image" {
                 attachment := msg.Attachments[0]
-                _, err := insertFileAttachment(tx, attachment, msgData.ChatItemID, msg.IsSent, jsonDir)
+                _, err := insertFileAttachment(tx, attachment, msgData.ChatItemID, msg.IsSent, jsonDir, msg.MessageType)
                 if err != nil {
                     log.Printf("Warning: failed to create file attachment for %s: %v", attachment.Filename, err)
                     // Continue without file attachment
@@ -718,10 +834,32 @@ func bulkInsertChatItems(tx *sql.Tx, data BulkInsertData, jsonDir string) error 
                     }
                     
                 case "video":
-                    // For videos, use file type
-                    msgContent = map[string]interface{}{
-                        "type": "file",
-                        "text": msg.Content,
+                    // For videos, try to generate thumbnail and get duration
+                    if len(msg.Attachments) > 0 {
+                        attachment := msg.Attachments[0]
+                        videoPath := filepath.Join(jsonDir, attachment.URL)
+                        thumbnailBase64, duration, err := generateVideoThumbnail(videoPath)
+                        if err != nil {
+                            log.Printf("Warning: failed to generate video thumbnail for %s: %v", attachment.Filename, err)
+                            // Fallback to file type without thumbnail
+                            msgContent = map[string]interface{}{
+                                "type": "file",
+                                "text": msg.Content,
+                            }
+                        } else {
+                            // Success - create video content with thumbnail and duration
+                            msgContent = map[string]interface{}{
+                                "type":     "video",
+                                "text":     msg.Content,
+                                "image":    thumbnailBase64,
+                                "duration": duration,
+                            }
+                        }
+                    } else {
+                        msgContent = map[string]interface{}{
+                            "type": "file",
+                            "text": msg.Content,
+                        }
                     }
                     
                 case "voice":
@@ -768,6 +906,7 @@ func bulkInsertChatItems(tx *sql.Tx, data BulkInsertData, jsonDir string) error 
                 "item_sent":          itemSent,
                 "item_status":        itemStatus,
                 "item_deleted":       0, // Not deleted
+                "item_edited":        0, // Not edited (prevent edited icon)
                 "include_in_history": 1, // Include in history
                 "user_mention":       0, // Not a mention
                 "show_group_as_sender": 0, // Not a group message
@@ -981,7 +1120,7 @@ func bulkInsertMsgDeliveries(tx *sql.Tx, data BulkInsertData) error {
 }
 
 // Helper function to insert file attachment and return file_id
-func insertFileAttachment(tx *sql.Tx, attachment UniversalAttachment, chatItemID int, isSent bool, jsonDir string) (int, error) {
+func insertFileAttachment(tx *sql.Tx, attachment UniversalAttachment, chatItemID int, isSent bool, jsonDir string, messageType string) (int, error) {
     filePath := filepath.Join(jsonDir, attachment.URL)
     
     // Check if file exists
@@ -1008,23 +1147,46 @@ func insertFileAttachment(tx *sql.Tx, attachment UniversalAttachment, chatItemID
         return 0, err
     }
     
+    // For videos, copy to SimpleX files directory and create as local files
+    if messageType == "video" {
+        err = copyVideoToSimplexDir(filePath, attachment.Filename)
+        if err != nil {
+            return 0, fmt.Errorf("failed to copy video to SimpleX directory: %w", err)
+        }
+    }
+    
+    // For videos, create as local files without encryption (like native SimpleX videos)
+    var fileStatus string
+    var protocol string
+    if messageType == "video" {
+        fileStatus = "snd_stored"  // Local storage, not transferred
+        protocol = "local"         // Local protocol, not smp/xftp
+    } else {
+        // For other files, use standard transfer status
+        if isSent {
+            fileStatus = "snd_complete"
+        } else {
+            fileStatus = "rcv_complete"
+        }
+        protocol = "smp"
+    }
+    
     overrideFields := map[string]interface{}{
         "file_id":        nextFileID,
         "contact_id":     4, // Associate with specified contact
         "file_name":      attachment.Filename,
-        "file_path":      filePath,
+        "file_path":      attachment.Filename, // Store just filename like working video
         "file_size":      attachment.Size,
         "chunk_size":     16384, // Standard chunk size
         "user_id":        1, // Use available user ID
         "chat_item_id":   chatItemID,
-        "ci_file_status": func() string {
-            if isSent {
-                return "snd_complete"
-            }
-            return "rcv_complete"
-        }(),
+        "ci_file_status": fileStatus,
+        "protocol":       protocol,
         "created_at":     time.Now().Format("2006-01-02 15:04:05"),
         "updated_at":     time.Now().Format("2006-01-02 15:04:05"),
+        // Explicitly set encryption fields to NULL for local videos
+        "file_crypto_key":   nil,
+        "file_crypto_nonce": nil,
     }
     
     rowValues := make([]interface{}, len(columns))
@@ -1047,14 +1209,17 @@ func insertFileAttachment(tx *sql.Tx, attachment UniversalAttachment, chatItemID
         return 0, fmt.Errorf("failed to insert file: %w", err)
     }
     
-    // Insert into snd_files or rcv_files table
-    if isSent {
-        err = insertSndFile(tx, nextFileID)
-    } else {
-        err = insertRcvFile(tx, nextFileID)
-    }
-    if err != nil {
-        return 0, fmt.Errorf("failed to insert file transfer record: %w", err)
+    // For videos with local storage, don't create snd_files/rcv_files entries (like working video)
+    if messageType != "video" {
+        // Insert into snd_files or rcv_files table for non-video files
+        if isSent {
+            err = insertSndFile(tx, nextFileID)
+        } else {
+            err = insertRcvFile(tx, nextFileID)
+        }
+        if err != nil {
+            return 0, fmt.Errorf("failed to insert file transfer record: %w", err)
+        }
     }
     
     return nextFileID, nil
@@ -1071,12 +1236,20 @@ func insertSndFile(tx *sql.Tx, fileID int) error {
         return err
     }
     
+    // Generate unique last_inline_msg_delivery_id to avoid constraint violations
+    var nextDeliveryID int
+    err = tx.QueryRow("SELECT COALESCE(MAX(last_inline_msg_delivery_id), 0) + 1 FROM snd_files").Scan(&nextDeliveryID)
+    if err != nil {
+        return fmt.Errorf("failed to get next delivery ID: %w", err)
+    }
+    
     overrideFields := map[string]interface{}{
-        "file_id":      fileID,
-        "connection_id": 1, // Use available connection
-        "file_status":   "complete",
-        "created_at":    time.Now().Format("2006-01-02 15:04:05"),
-        "updated_at":    time.Now().Format("2006-01-02 15:04:05"),
+        "file_id":                     fileID,
+        "connection_id":               1, // Use available connection
+        "file_status":                 "complete",
+        "last_inline_msg_delivery_id": nextDeliveryID,
+        "created_at":                  time.Now().Format("2006-01-02 15:04:05"),
+        "updated_at":                  time.Now().Format("2006-01-02 15:04:05"),
     }
     
     rowValues := make([]interface{}, len(columns))
