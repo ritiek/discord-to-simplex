@@ -290,6 +290,13 @@ func copyFileToSimplexDir(sourcePath, filename string) error {
         return fmt.Errorf("failed to create SimpleX files directory: %w", err)
     }
     
+    // Truncate filename if too long (filesystem limit is usually 255 chars)
+    if len(filename) > 200 {
+        ext := filepath.Ext(filename)
+        baseName := filename[:200-len(ext)]
+        filename = baseName + ext
+    }
+    
     // Copy file
     sourceFile, err := os.Open(sourcePath)
     if err != nil {
@@ -1165,6 +1172,14 @@ func insertFileAttachment(tx *sql.Tx, attachment UniversalAttachment, chatItemID
         return 0, err
     }
     
+    // Truncate filename if too long (same logic as copyFileToSimplexDir)
+    truncatedFilename := attachment.Filename
+    if len(truncatedFilename) > 200 {
+        ext := filepath.Ext(truncatedFilename)
+        baseName := truncatedFilename[:200-len(ext)]
+        truncatedFilename = baseName + ext
+    }
+    
     // Copy all files to SimpleX files directory so they are accessible/downloadable
     err = copyFileToSimplexDir(filePath, attachment.Filename)
     if err != nil {
@@ -1199,8 +1214,8 @@ func insertFileAttachment(tx *sql.Tx, attachment UniversalAttachment, chatItemID
     overrideFields := map[string]interface{}{
         "file_id":        nextFileID,
         "contact_id":     contactID, // Associate with specified contact
-        "file_name":      attachment.Filename,
-        "file_path":      attachment.Filename, // Store just filename like working video
+        "file_name":      truncatedFilename, // Use truncated filename
+        "file_path":      truncatedFilename, // Store truncated filename like working video
         "file_size":      attachment.Size,
         "chunk_size":     16384, // Standard chunk size
         "user_id":        1, // Use available user ID
