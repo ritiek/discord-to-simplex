@@ -3,8 +3,8 @@
 Import your Discord chat history into SimpleX Chat with full support for text messages, images, videos, and voice messages.
 Only works for DMs.
 
-**DISCLAIMER:** Vibe-coded with claude-code using Sonnet 4. It seems to work. However, to go through the codebase properly
-using human eyes is still pending.
+**DISCLAIMER:** This tool was almost entirely vibe-coded using claude-code with Sonnet 4. It looks to work alright. Still
+a good idea to do a human-go-through of the codebase properly sometime..
 
 ## Features
 
@@ -38,6 +38,8 @@ nix develop
 **TODO:** Add more installation methods.
 
 ## Usage
+
+**Make sure to take the latest export of your SimpleX Chat DB and back it up before proceeding!**
 
 ### Step 1: Export Discord Chat
 
