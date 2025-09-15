@@ -9,11 +9,12 @@ a good idea to do a human-go-through of the codebase properly sometime..
 ## Features
 
 - **Complete message import**: Text, images, videos, voice messages, and file attachments
+- **Discord reaction support**: Imports all Discord reactions (emoji reactions show up correctly for SimpleX's 6 supported emojis: 👍, 🚀, ❤, ✅, 😀, 😢; other emojis display as "?" but are still imported)
 - **Video thumbnails**: Automatically generates thumbnails for imported videos using FFmpeg
 - **Downloadable attachments**: Images, videos, and voice messages are properly saved and accessible in SimpleX
 - **Contact mapping**: Import messages to any existing SimpleX contact
 - **Message threading**: Preserves Discord reply structure
-- **Batch processing**: Efficient bulk import with configurable batch sizes
+- **Batch processing**: Efficient bulk import with using pre-configured batch sizes
 - **SQLCipher support**: Works with encrypted SimpleX databases
 
 ## Prerequisites
@@ -141,13 +142,14 @@ simplexmq: v6.4.4.1 ( )
 ## How It Works
 
 1. **Extracts SimpleX ZIP export** to a temporary directory
-2. **Parses Discord JSON export** and extracts messages, attachments, and metadata
-3. **Generates video thumbnails** using FFmpeg for proper display in SimpleX
-4. **Copies attachments** to the extracted SimpleX files directory for accessibility
-5. **Maps Discord users** to SimpleX contacts based on your specification
-6. **Bulk inserts** messages into the extracted SimpleX database with proper relationships
-7. **Preserves message order** and reply threading from Discord
-8. **Creates updated ZIP export** with all imported messages and files ready for SimpleX import
+2. **Parses Discord JSON export** and extracts messages, attachments, reactions, and metadata
+3. **Imports Discord reactions** with proper emoji normalization for SimpleX compatibility
+4. **Generates video thumbnails** using FFmpeg for proper display in SimpleX
+5. **Copies attachments** to the extracted SimpleX files directory for accessibility
+6. **Maps Discord users** to SimpleX contacts based on your specification
+7. **Bulk inserts** messages and reactions into the extracted SimpleX database with proper relationships
+8. **Preserves message order** and reply threading from Discord
+9. **Creates updated ZIP export** with all imported messages and files ready for SimpleX import
 
 ## Supported File Types
 
@@ -160,6 +162,7 @@ simplexmq: v6.4.4.1 ( )
 
 The importer creates proper SimpleX database entries:
 - Messages in `messages` and `chat_items` tables
+- Discord reactions in `chat_item_reactions` table with proper emoji normalization
 - File attachments in `files`, `snd_files`, `rcv_files` tables
 - Proper contact associations and message threading
 - Compatible with SimpleX's encryption and sync features

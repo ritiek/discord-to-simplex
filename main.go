@@ -10,7 +10,6 @@ import (
     "flag"
     "fmt"
     "io"
-    "io/ioutil"
     "log"
     "os"
     "os/exec"
@@ -25,24 +24,10 @@ import (
 
 // Discord JSON export structure
 type DiscordExport struct {
-    Guild    DiscordGuild     `json:"guild"`
-    Channel  DiscordChannel   `json:"channel"`
+    Channel  struct {
+        Name string `json:"name"`
+    } `json:"channel"`
     Messages []DiscordMessage `json:"messages"`
-}
-
-type DiscordGuild struct {
-    ID      string `json:"id"`
-    Name    string `json:"name"`
-    IconURL string `json:"iconUrl"`
-}
-
-type DiscordChannel struct {
-    ID         string      `json:"id"`
-    Type       string      `json:"type"`
-    CategoryID interface{} `json:"categoryId"`
-    Category   interface{} `json:"category"`
-    Name       string      `json:"name"`
-    Topic      interface{} `json:"topic"`
 }
 
 // Intermediary message format - universal structure
@@ -67,7 +52,6 @@ type UniversalMessage struct {
 
     // Thread/reply information
     ReplyToID   *string `json:"replyToId,omitempty"`
-    ThreadID    *string `json:"threadId,omitempty"`
 
     // Quote information for Discord replies
     QuotedMessage *QuotedMessage `json:"quotedMessage,omitempty"`
@@ -76,9 +60,7 @@ type UniversalMessage struct {
     PlatformData map[string]interface{} `json:"platformData,omitempty"`
 
     // Message state
-    IsDeleted   bool `json:"isDeleted"`
     IsPinned    bool `json:"isPinned"`
-    IsSystem    bool `json:"isSystem"`
     IsSent      bool `json:"isSent"` // New field to track if message was sent by the user
 }
 
@@ -119,13 +101,6 @@ type UniversalReaction struct {
     Emoji   string   `json:"emoji"`
     Count   int      `json:"count"`
     UserIDs []string `json:"userIds"`
-}
-
-type DiscordAttachment struct {
-    ID            string `json:"id"`
-    URL           string `json:"url"`
-    FileName      string `json:"fileName"`
-    FileSizeBytes int64  `json:"fileSizeBytes"`
 }
 
 // Updated Discord message structures to match the JSON format
@@ -175,6 +150,20 @@ type DiscordReference struct {
     GuildID   interface{} `json:"guildId"`
 }
 
+type DiscordReaction struct {
+    Emoji DiscordEmoji     `json:"emoji"`
+    Count int              `json:"count"`
+    Users []DiscordAuthor  `json:"users"`
+}
+
+type DiscordEmoji struct {
+    ID         string `json:"id"`
+    Name       string `json:"name"`
+    Code       string `json:"code"`
+    IsAnimated bool   `json:"isAnimated"`
+    ImageURL   string `json:"imageUrl"`
+}
+
 // Prepared insert data structures
 type MessageInsertData struct {
     MessageID   int
@@ -196,7 +185,7 @@ type BulkInsertData struct {
 
 // Helper function to read and encode image as base64
 func encodeImageToBase64(imagePath string) (string, error) {
-    imageData, err := ioutil.ReadFile(imagePath)
+    imageData, err := os.ReadFile(imagePath)
     if err != nil {
         return "", fmt.Errorf("failed to read image file %s: %w", imagePath, err)
     }
@@ -265,7 +254,7 @@ func generateVideoThumbnail(videoPath string) (string, int, error) {
     }
 
     // Read the thumbnail file
-    thumbnailData, err := ioutil.ReadFile(thumbnailPath)
+    thumbnailData, err := os.ReadFile(thumbnailPath)
     if err != nil {
         return "", 0, fmt.Errorf("failed to read thumbnail: %w", err)
     }
@@ -312,7 +301,7 @@ func promptForPassword() (string, error) {
 // Extract SimpleX ZIP export to temporary directory
 func extractSimplexZip(zipPath string) (string, error) {
     // Create temporary directory
-    tempDir, err := ioutil.TempDir("", "simplex_import_")
+    tempDir, err := os.MkdirTemp("", "simplex_import_")
     if err != nil {
         return "", fmt.Errorf("failed to create temp directory: %w", err)
     }
@@ -533,10 +522,6 @@ func copyFileToSimplexDir(sourcePath, filename, simplexFilesDir string) error {
     return nil
 }
 
-// Deprecated: use copyFileToSimplexDir instead
-func copyVideoToSimplexDir(sourcePath, filename string) error {
-    return copyFileToSimplexDir(sourcePath, filename, "/home/ritiek/.local/share/simplex/simplex_v1_files")
-}
 
 func getContactIDByName(db *sql.DB, contactName string) (int, error) {
     var contactID int
@@ -611,6 +596,32 @@ func ConvertDiscordMessage(discordMsg DiscordMessage, myUsername string, discord
         })
     }
 
+    // Convert reactions
+    var reactions []UniversalReaction
+    for _, react := range discordMsg.Reactions {
+        if reactMap, ok := react.(map[string]interface{}); ok {
+            if emojiMap, ok := reactMap["emoji"].(map[string]interface{}); ok {
+                emoji := fmt.Sprintf("%v", emojiMap["name"])
+                count := int(reactMap["count"].(float64))
+
+                var userIDs []string
+                if users, ok := reactMap["users"].([]interface{}); ok {
+                    for _, user := range users {
+                        if userMap, ok := user.(map[string]interface{}); ok {
+                            userIDs = append(userIDs, fmt.Sprintf("%v", userMap["id"]))
+                        }
+                    }
+                }
+
+                reactions = append(reactions, UniversalReaction{
+                    Emoji:   emoji,
+                    Count:   count,
+                    UserIDs: userIDs,
+                })
+            }
+        }
+    }
+
     // Handle reply reference - use the mapping to get the correct shared_msg_id
     var replyToID *string
     var quotedMessage *QuotedMessage
@@ -671,6 +682,7 @@ func ConvertDiscordMessage(discordMsg DiscordMessage, myUsername string, discord
             },
         },
         Mentions:  mentions,
+        Reactions: reactions,
         ReplyToID: replyToID,
         IsPinned:  discordMsg.IsPinned,
         IsSent:    isSent,
@@ -1564,6 +1576,80 @@ func insertRcvFile(tx *sql.Tx, fileID int) error {
     return err
 }
 
+func normalizeEmojiForSimpleX(emoji string) string {
+    // Remove variation selectors (U+FE0E, U+FE0F) and other modifiers that Discord adds
+    // but SimpleX doesn't support
+    normalized := ""
+    for _, r := range emoji {
+        // Skip variation selectors and other modifier characters
+        if r != '\uFE0E' && r != '\uFE0F' {
+            normalized += string(r)
+        }
+    }
+    return normalized
+}
+
+func bulkInsertReactions(tx *sql.Tx, data BulkInsertData, contactID int) error {
+    // Get the next available reaction ID
+    var nextReactionID int
+    err := tx.QueryRow("SELECT COALESCE(MAX(chat_item_reaction_id), 0) + 1 FROM chat_item_reactions").Scan(&nextReactionID)
+    if err != nil {
+        return fmt.Errorf("failed to get next reaction ID: %w", err)
+    }
+
+    reactionIDCounter := nextReactionID
+
+    for _, msgData := range data.Messages {
+        msg := msgData.Message
+
+        for _, reaction := range msg.Reactions {
+            // Normalize emoji by removing variation selectors for SimpleX compatibility
+            normalizedEmoji := normalizeEmojiForSimpleX(reaction.Emoji)
+
+            // Create SimpleX format reaction JSON
+            reactionJSON := fmt.Sprintf(`{"type":"emoji","emoji":"%s"}`, normalizedEmoji)
+
+            // In SimpleX, reactions need to track who made the reaction
+            // Since we're importing from Discord where we don't have individual reaction senders,
+            // we'll assume the contact reacted to our sent messages and we reacted to their messages
+            var reactionSent int
+            var actualContactID interface{}
+            if msg.IsSent {
+                // If we sent the message, the contact reacted to it
+                reactionSent = 0
+                actualContactID = contactID
+            } else {
+                // If the contact sent the message, we reacted to it
+                reactionSent = 1
+                actualContactID = contactID // User reactions also need the contact_id
+            }
+
+            // Insert reaction
+            _, err = tx.Exec(`
+                INSERT INTO chat_item_reactions (
+                    chat_item_reaction_id,
+                    shared_msg_id,
+                    contact_id,
+                    created_by_msg_id,
+                    reaction,
+                    reaction_sent,
+                    reaction_ts,
+                    created_at,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            `, reactionIDCounter, msgData.SharedMsgID, actualContactID, nil, reactionJSON, reactionSent, msg.Timestamp.Format("2006-01-02 15:04:05.000000000"), msg.Timestamp.Format("2006-01-02 15:04:05"), msg.Timestamp.Format("2006-01-02 15:04:05"))
+
+            if err != nil {
+                return fmt.Errorf("failed to insert reaction: %w", err)
+            }
+
+            reactionIDCounter++
+        }
+    }
+
+    return nil
+}
+
 func bulkInsertUniversalMessages(db *sql.DB, messages []UniversalMessage, startMessageID int, jsonDir string, contactID int, simplexFilesDir string) error {
     // Start transaction
     tx, err := db.Begin()
@@ -1626,6 +1712,11 @@ func bulkInsertUniversalMessages(db *sql.DB, messages []UniversalMessage, startM
         return fmt.Errorf("failed to bulk insert msg deliveries: %w", err)
     }
 
+    err = bulkInsertReactions(tx, bulkData, contactID)
+    if err != nil {
+        return fmt.Errorf("failed to bulk insert reactions: %w", err)
+    }
+
     // Commit transaction
     err = tx.Commit()
     if err != nil {
@@ -1636,7 +1727,7 @@ func bulkInsertUniversalMessages(db *sql.DB, messages []UniversalMessage, startM
 }
 
 func loadDiscordExport(filePath string) (*DiscordExport, error) {
-    data, err := ioutil.ReadFile(filePath)
+    data, err := os.ReadFile(filePath)
     if err != nil {
         return nil, fmt.Errorf("failed to read file: %w", err)
     }
@@ -1794,7 +1885,6 @@ func main() {
     }
 
     // Process messages in batches
-    // totalMessages := 40
     totalMessages := len(universalMessages)
     fmt.Printf("Processing %d messages in batches of %d...\n", totalMessages, batchSize)
 
