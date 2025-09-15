@@ -1,6 +1,8 @@
 package main
 
 import (
+    "archive/zip"
+    "bufio"
     "database/sql"
     "encoding/base64"
     "encoding/json"
@@ -14,8 +16,10 @@ import (
     "os/exec"
     "strconv"
     "strings"
+    "syscall"
     "time"
 
+    "golang.org/x/term"
     _ "github.com/xeodou/go-sqlcipher"
 )
 
@@ -223,17 +227,17 @@ func generateVideoThumbnail(videoPath string) (string, int, error) {
     if err := os.MkdirAll(tempDir, 0755); err != nil {
         return "", 0, fmt.Errorf("failed to create temp directory: %w", err)
     }
-    
+
     // Generate unique thumbnail filename
     thumbnailPath := filepath.Join(tempDir, fmt.Sprintf("thumb_%d.jpg", os.Getpid()))
-    
+
     // Get video duration first
     durationCmd := exec.Command("ffprobe", "-v", "quiet", "-show_entries", "format=duration", "-of", "csv=p=0", videoPath)
     durationOutput, err := durationCmd.Output()
     if err != nil {
         return "", 0, fmt.Errorf("failed to get video duration: %w", err)
     }
-    
+
     // Parse duration (convert from float seconds to int)
     var duration int
     if len(durationOutput) > 0 {
@@ -246,11 +250,11 @@ func generateVideoThumbnail(videoPath string) (string, int, error) {
     } else {
         duration = 86 // Default fallback duration
     }
-    
+
     // Use ffmpeg to extract thumbnail at 1 second mark
     cmd := exec.Command("ffmpeg", "-i", videoPath, "-ss", "00:00:01", "-vframes", "1", "-f", "image2", "-s", "320x240", thumbnailPath, "-y")
     cmd.Stderr = nil // Suppress ffmpeg output
-    
+
     if err := cmd.Run(); err != nil {
         // If ffmpeg fails, try without seeking
         cmd = exec.Command("ffmpeg", "-i", videoPath, "-vframes", "1", "-f", "image2", "-s", "320x240", thumbnailPath, "-y")
@@ -259,16 +263,16 @@ func generateVideoThumbnail(videoPath string) (string, int, error) {
             return "", 0, fmt.Errorf("failed to generate thumbnail with ffmpeg: %w", err)
         }
     }
-    
+
     // Read the thumbnail file
     thumbnailData, err := ioutil.ReadFile(thumbnailPath)
     if err != nil {
         return "", 0, fmt.Errorf("failed to read thumbnail: %w", err)
     }
-    
+
     // Clean up temp file
     os.Remove(thumbnailPath)
-    
+
     // Return base64 encoded thumbnail and duration
     return fmt.Sprintf("data:image/jpg;base64,%s", base64.StdEncoding.EncodeToString(thumbnailData)), duration, nil
 }
@@ -281,54 +285,264 @@ func parseFloat(s string) float64 {
     return 0
 }
 
+// Prompt for SimpleX database password securely
+func promptForPassword() (string, error) {
+    fmt.Print("Enter SimpleX database password: ")
+
+    // Check if we're running in a terminal
+    if term.IsTerminal(int(syscall.Stdin)) {
+        // Use secure password input (no echo)
+        passwordBytes, err := term.ReadPassword(int(syscall.Stdin))
+        fmt.Println() // Print newline after password input
+        if err != nil {
+            return "", fmt.Errorf("failed to read password: %w", err)
+        }
+        return string(passwordBytes), nil
+    } else {
+        // Fallback for non-terminal input (testing, pipes, etc.)
+        reader := bufio.NewReader(os.Stdin)
+        password, err := reader.ReadString('\n')
+        if err != nil {
+            return "", fmt.Errorf("failed to read password: %w", err)
+        }
+        return strings.TrimSpace(password), nil
+    }
+}
+
+// Extract SimpleX ZIP export to temporary directory
+func extractSimplexZip(zipPath string) (string, error) {
+    // Create temporary directory
+    tempDir, err := ioutil.TempDir("", "simplex_import_")
+    if err != nil {
+        return "", fmt.Errorf("failed to create temp directory: %w", err)
+    }
+
+    // Open ZIP file
+    r, err := zip.OpenReader(zipPath)
+    if err != nil {
+        os.RemoveAll(tempDir)
+        return "", fmt.Errorf("failed to open ZIP file: %w", err)
+    }
+    defer r.Close()
+
+    // Extract files
+    for _, f := range r.File {
+        rc, err := f.Open()
+        if err != nil {
+            os.RemoveAll(tempDir)
+            return "", fmt.Errorf("failed to open file in ZIP: %w", err)
+        }
+
+        path := filepath.Join(tempDir, f.Name)
+
+        if f.FileInfo().IsDir() {
+            os.MkdirAll(path, f.FileInfo().Mode())
+            rc.Close()
+            continue
+        }
+
+        // Create directory if needed
+        if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+            rc.Close()
+            os.RemoveAll(tempDir)
+            return "", fmt.Errorf("failed to create directory: %w", err)
+        }
+
+        // Extract file
+        outFile, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, f.FileInfo().Mode())
+        if err != nil {
+            rc.Close()
+            os.RemoveAll(tempDir)
+            return "", fmt.Errorf("failed to create output file: %w", err)
+        }
+
+        _, err = io.Copy(outFile, rc)
+        outFile.Close()
+        rc.Close()
+
+        if err != nil {
+            os.RemoveAll(tempDir)
+            return "", fmt.Errorf("failed to extract file: %w", err)
+        }
+    }
+
+    return tempDir, nil
+}
+
+// Create new SimpleX ZIP export from directory
+func createSimplexZip(sourceDir, outputZipPath string) error {
+    // Create output ZIP file
+    zipFile, err := os.Create(outputZipPath)
+    if err != nil {
+        return fmt.Errorf("failed to create ZIP file: %w", err)
+    }
+    defer zipFile.Close()
+
+    zipWriter := zip.NewWriter(zipFile)
+    defer zipWriter.Close()
+
+    // Walk through source directory
+    err = filepath.Walk(sourceDir, func(filePath string, info os.FileInfo, err error) error {
+        if err != nil {
+            return err
+        }
+
+        // Get relative path from source directory
+        relPath, err := filepath.Rel(sourceDir, filePath)
+        if err != nil {
+            return err
+        }
+
+        // Skip root directory itself
+        if relPath == "." {
+            return nil
+        }
+
+        // Create header
+        header, err := zip.FileInfoHeader(info)
+        if err != nil {
+            return err
+        }
+        header.Name = relPath
+
+        if info.IsDir() {
+            header.Name += "/"
+        } else {
+            header.Method = zip.Deflate
+        }
+
+        // Create file in ZIP
+        writer, err := zipWriter.CreateHeader(header)
+        if err != nil {
+            return err
+        }
+
+        if !info.IsDir() {
+            // Copy file content
+            file, err := os.Open(filePath)
+            if err != nil {
+                return err
+            }
+            defer file.Close()
+
+            _, err = io.Copy(writer, file)
+            if err != nil {
+                return err
+            }
+        }
+
+        return nil
+    })
+
+    return err
+}
+
+// Find SimpleX database file in extracted directory
+func findSimplexDB(extractedDir string) (string, error) {
+    var dbPath string
+
+    err := filepath.Walk(extractedDir, func(path string, info os.FileInfo, err error) error {
+        if err != nil {
+            return err
+        }
+
+        if !info.IsDir() && (strings.Contains(info.Name(), "simplex_v1_chat.db") || strings.Contains(info.Name(), "chat.db")) {
+            dbPath = path
+            return filepath.SkipDir // Found it, stop walking
+        }
+
+        return nil
+    })
+
+    if err != nil {
+        return "", fmt.Errorf("failed to search for database: %w", err)
+    }
+
+    if dbPath == "" {
+        return "", fmt.Errorf("no SimpleX database found in ZIP")
+    }
+
+    return dbPath, nil
+}
+
+// Find or create SimpleX files directory in extracted directory
+func findOrCreateSimplexFilesDir(extractedDir string) (string, error) {
+    var filesDir string
+
+    err := filepath.Walk(extractedDir, func(path string, info os.FileInfo, err error) error {
+        if err != nil {
+            return err
+        }
+
+        if info.IsDir() && (strings.Contains(info.Name(), "simplex_v1_files") || strings.Contains(info.Name(), "files")) {
+            filesDir = path
+            return filepath.SkipDir // Found it, stop walking
+        }
+
+        return nil
+    })
+
+    if err != nil {
+        return "", fmt.Errorf("failed to search for files directory: %w", err)
+    }
+
+    // If not found, create it
+    if filesDir == "" {
+        filesDir = filepath.Join(extractedDir, "simplex_v1_files")
+        if err := os.MkdirAll(filesDir, 0755); err != nil {
+            return "", fmt.Errorf("failed to create files directory: %w", err)
+        }
+    }
+
+    return filesDir, nil
+}
+
 // Helper function to copy video file to SimpleX files directory
-func copyFileToSimplexDir(sourcePath, filename string) error {
-    simplexFilesDir := "/home/ritiek/.local/share/simplex/simplex_v1_files"
-    
+func copyFileToSimplexDir(sourcePath, filename, simplexFilesDir string) error {
     // Ensure SimpleX files directory exists
     if err := os.MkdirAll(simplexFilesDir, 0755); err != nil {
         return fmt.Errorf("failed to create SimpleX files directory: %w", err)
     }
-    
+
     // Truncate filename if too long (filesystem limit is usually 255 chars)
     if len(filename) > 200 {
         ext := filepath.Ext(filename)
         baseName := filename[:200-len(ext)]
         filename = baseName + ext
     }
-    
+
     // Copy file
     sourceFile, err := os.Open(sourcePath)
     if err != nil {
         return fmt.Errorf("failed to open source file: %w", err)
     }
     defer sourceFile.Close()
-    
+
     destPath := filepath.Join(simplexFilesDir, filename)
     destFile, err := os.Create(destPath)
     if err != nil {
         return fmt.Errorf("failed to create destination file: %w", err)
     }
     defer destFile.Close()
-    
+
     _, err = io.Copy(destFile, sourceFile)
     if err != nil {
         return fmt.Errorf("failed to copy file: %w", err)
     }
-    
+
     return nil
 }
 
 // Deprecated: use copyFileToSimplexDir instead
 func copyVideoToSimplexDir(sourcePath, filename string) error {
-    return copyFileToSimplexDir(sourcePath, filename)
+    return copyFileToSimplexDir(sourcePath, filename, "/home/ritiek/.local/share/simplex/simplex_v1_files")
 }
 
 func getContactIDByName(db *sql.DB, contactName string) (int, error) {
     var contactID int
-    query := `SELECT c.contact_id FROM contacts c 
-              LEFT JOIN contact_profiles cp ON c.contact_profile_id = cp.contact_profile_id 
-              WHERE c.deleted = 0 AND (c.local_display_name = ? OR cp.display_name = ?) 
+    query := `SELECT c.contact_id FROM contacts c
+              LEFT JOIN contact_profiles cp ON c.contact_profile_id = cp.contact_profile_id
+              WHERE c.deleted = 0 AND (c.local_display_name = ? OR cp.display_name = ?)
               LIMIT 1`
     err := db.QueryRow(query, contactName, contactName).Scan(&contactID)
     if err != nil {
@@ -357,7 +571,7 @@ func ConvertDiscordMessage(discordMsg DiscordMessage, myUsername string, discord
         for _, att := range discordMsg.Attachments {
             if attMap, ok := att.(map[string]interface{}); ok {
                 filename := fmt.Sprintf("%v", attMap["fileName"])
-                
+
                 // Determine message type based on file extension
                 ext := strings.ToLower(filepath.Ext(filename))
                 switch ext {
@@ -370,7 +584,7 @@ func ConvertDiscordMessage(discordMsg DiscordMessage, myUsername string, discord
                 default:
                     messageType = "file"
                 }
-                
+
                 attachments = append(attachments, UniversalAttachment{
                     ID:       fmt.Sprintf("%v", attMap["id"]),
                     Filename: filename,
@@ -379,7 +593,7 @@ func ConvertDiscordMessage(discordMsg DiscordMessage, myUsername string, discord
                 })
             }
         }
-        
+
         // If no message type was set (no attachments processed), default to file
         if messageType == "text" && len(attachments) > 0 {
             messageType = "file"
@@ -592,7 +806,7 @@ func bulkInsertMessages(tx *sql.Tx, data BulkInsertData, jsonDir string, contact
             // Handle different message types with attachments
             if len(msg.Attachments) > 0 {
                 attachment := msg.Attachments[0] // Use first attachment
-                
+
                 switch msg.MessageType {
                 case "image":
                     imagePath := filepath.Join(jsonDir, attachment.URL)
@@ -601,7 +815,7 @@ func bulkInsertMessages(tx *sql.Tx, data BulkInsertData, jsonDir string, contact
                         log.Printf("Warning: failed to encode image %s: %v", imagePath, err)
                         // Fallback to text with file info
                         content = map[string]interface{}{
-                            "text": fmt.Sprintf("[Image: %s]%s", attachment.Filename, 
+                            "text": fmt.Sprintf("[Image: %s]%s", attachment.Filename,
                                 func() string { if msg.Content != "" { return "\n" + msg.Content }; return "" }()),
                             "type": "text",
                         }
@@ -621,7 +835,7 @@ func bulkInsertMessages(tx *sql.Tx, data BulkInsertData, jsonDir string, contact
                             "fileSize": attachment.Size,
                         }
                     }
-                    
+
                 case "video":
                     // For videos, try to generate thumbnail and get duration
                     videoPath := filepath.Join(jsonDir, attachment.URL)
@@ -651,7 +865,7 @@ func bulkInsertMessages(tx *sql.Tx, data BulkInsertData, jsonDir string, contact
                         "fileName": attachment.Filename,
                         "fileSize": attachment.Size,
                     }
-                    
+
                 case "voice":
                     // For voice messages, create file attachment
                     content = map[string]interface{}{
@@ -667,7 +881,7 @@ func bulkInsertMessages(tx *sql.Tx, data BulkInsertData, jsonDir string, contact
                         "fileName": attachment.Filename,
                         "fileSize": attachment.Size,
                     }
-                    
+
                 default: // "file" or unknown
                     // Generic file attachment
                     content = map[string]interface{}{
@@ -780,7 +994,7 @@ func bulkInsertMessages(tx *sql.Tx, data BulkInsertData, jsonDir string, contact
     return nil
 }
 
-func bulkInsertChatItems(tx *sql.Tx, data BulkInsertData, jsonDir string, contactID int) error {
+func bulkInsertChatItems(tx *sql.Tx, data BulkInsertData, jsonDir string, contactID int, simplexFilesDir string) error {
     templateRow, err := getTemplateRow(tx, "chat_items", "chat_item_id")
     if err != nil {
         return fmt.Errorf("failed to get template row: %w", err)
@@ -808,11 +1022,11 @@ func bulkInsertChatItems(tx *sql.Tx, data BulkInsertData, jsonDir string, contac
 
         for j, msgData := range chunk {
             msg := msgData.Message
-            
+
             // Handle file attachments for all message types with attachments
             if len(msg.Attachments) > 0 {
                 attachment := msg.Attachments[0]
-                _, err := insertFileAttachment(tx, attachment, msgData.ChatItemID, msg.IsSent, jsonDir, msg.MessageType, contactID)
+                _, err := insertFileAttachment(tx, attachment, msgData.ChatItemID, msg.IsSent, jsonDir, msg.MessageType, contactID, simplexFilesDir)
                 if err != nil {
                     log.Printf("Warning: failed to create file attachment for %s: %v", attachment.Filename, err)
                     // Continue without file attachment
@@ -837,7 +1051,7 @@ func bulkInsertChatItems(tx *sql.Tx, data BulkInsertData, jsonDir string, contac
             // Handle different message types with attachments
             if len(msg.Attachments) > 0 {
                 attachment := msg.Attachments[0]
-                
+
                 switch msg.MessageType {
                 case "image":
                     imagePath := filepath.Join(jsonDir, attachment.URL)
@@ -857,7 +1071,7 @@ func bulkInsertChatItems(tx *sql.Tx, data BulkInsertData, jsonDir string, contac
                             "image": imageBase64,
                         }
                     }
-                    
+
                 case "video":
                     // For videos, try to generate thumbnail and get duration
                     if len(msg.Attachments) > 0 {
@@ -886,14 +1100,14 @@ func bulkInsertChatItems(tx *sql.Tx, data BulkInsertData, jsonDir string, contac
                             "text": msg.Content,
                         }
                     }
-                    
+
                 case "voice":
                     // For voice messages, use file type
                     msgContent = map[string]interface{}{
                         "type": "file",
                         "text": msg.Content,
                     }
-                    
+
                 default: // "file" or unknown
                     // Generic file attachment
                     msgContent = map[string]interface{}{
@@ -1145,33 +1359,33 @@ func bulkInsertMsgDeliveries(tx *sql.Tx, data BulkInsertData) error {
 }
 
 // Helper function to insert file attachment and return file_id
-func insertFileAttachment(tx *sql.Tx, attachment UniversalAttachment, chatItemID int, isSent bool, jsonDir string, messageType string, contactID int) (int, error) {
+func insertFileAttachment(tx *sql.Tx, attachment UniversalAttachment, chatItemID int, isSent bool, jsonDir string, messageType string, contactID int, simplexFilesDir string) (int, error) {
     filePath := filepath.Join(jsonDir, attachment.URL)
-    
+
     // Check if file exists
     if _, err := os.Stat(filePath); os.IsNotExist(err) {
         return 0, fmt.Errorf("file not found: %s", filePath)
     }
-    
+
     // Get template file row for default values
     templateRow, err := getTemplateRow(tx, "files", "file_id")
     if err != nil {
         return 0, fmt.Errorf("failed to get template file row: %w", err)
     }
-    
+
     // Get next file_id
     var nextFileID int
     err = tx.QueryRow("SELECT COALESCE(MAX(file_id), 0) + 1 FROM files").Scan(&nextFileID)
     if err != nil {
         return 0, fmt.Errorf("failed to get next file_id: %w", err)
     }
-    
+
     // Insert into files table
     columns, err := getTableColumns(tx, "files")
     if err != nil {
         return 0, err
     }
-    
+
     // Truncate filename if too long (same logic as copyFileToSimplexDir)
     truncatedFilename := attachment.Filename
     if len(truncatedFilename) > 200 {
@@ -1179,13 +1393,13 @@ func insertFileAttachment(tx *sql.Tx, attachment UniversalAttachment, chatItemID
         baseName := truncatedFilename[:200-len(ext)]
         truncatedFilename = baseName + ext
     }
-    
+
     // Copy all files to SimpleX files directory so they are accessible/downloadable
-    err = copyFileToSimplexDir(filePath, attachment.Filename)
+    err = copyFileToSimplexDir(filePath, attachment.Filename, simplexFilesDir)
     if err != nil {
         return 0, fmt.Errorf("failed to copy file to SimpleX directory: %w", err)
     }
-    
+
     // Set file status and protocol based on message type
     var fileStatus string
     var protocol string
@@ -1210,7 +1424,7 @@ func insertFileAttachment(tx *sql.Tx, attachment UniversalAttachment, chatItemID
         }
         protocol = "smp"
     }
-    
+
     overrideFields := map[string]interface{}{
         "file_id":        nextFileID,
         "contact_id":     contactID, // Associate with specified contact
@@ -1228,7 +1442,7 @@ func insertFileAttachment(tx *sql.Tx, attachment UniversalAttachment, chatItemID
         "file_crypto_key":   nil,
         "file_crypto_nonce": nil,
     }
-    
+
     rowValues := make([]interface{}, len(columns))
     for i, col := range columns {
         if val, override := overrideFields[col]; override {
@@ -1239,16 +1453,16 @@ func insertFileAttachment(tx *sql.Tx, attachment UniversalAttachment, chatItemID
             rowValues[i] = nil
         }
     }
-    
+
     placeholders := "(" + strings.Repeat("?,", len(columns)-1) + "?)"
     query := fmt.Sprintf("INSERT INTO files (%s) VALUES %s",
         strings.Join(columns, ", "), placeholders)
-    
+
     _, err = tx.Exec(query, rowValues...)
     if err != nil {
         return 0, fmt.Errorf("failed to insert file: %w", err)
     }
-    
+
     // Only videos don't need snd_files/rcv_files entries (they use local protocol)
     // Images and voice messages need these entries (they use xftp protocol)
     if messageType != "video" {
@@ -1262,7 +1476,7 @@ func insertFileAttachment(tx *sql.Tx, attachment UniversalAttachment, chatItemID
             return 0, fmt.Errorf("failed to insert file transfer record: %w", err)
         }
     }
-    
+
     return nextFileID, nil
 }
 
@@ -1271,19 +1485,19 @@ func insertSndFile(tx *sql.Tx, fileID int) error {
     if err != nil {
         return err
     }
-    
+
     columns, err := getTableColumns(tx, "snd_files")
     if err != nil {
         return err
     }
-    
+
     // Generate unique last_inline_msg_delivery_id to avoid constraint violations
     var nextDeliveryID int
     err = tx.QueryRow("SELECT COALESCE(MAX(last_inline_msg_delivery_id), 0) + 1 FROM snd_files").Scan(&nextDeliveryID)
     if err != nil {
         return fmt.Errorf("failed to get next delivery ID: %w", err)
     }
-    
+
     overrideFields := map[string]interface{}{
         "file_id":                     fileID,
         "connection_id":               1, // Use available connection
@@ -1292,7 +1506,7 @@ func insertSndFile(tx *sql.Tx, fileID int) error {
         "created_at":                  time.Now().Format("2006-01-02 15:04:05"),
         "updated_at":                  time.Now().Format("2006-01-02 15:04:05"),
     }
-    
+
     rowValues := make([]interface{}, len(columns))
     for i, col := range columns {
         if val, override := overrideFields[col]; override {
@@ -1303,11 +1517,11 @@ func insertSndFile(tx *sql.Tx, fileID int) error {
             rowValues[i] = nil
         }
     }
-    
+
     placeholders := "(" + strings.Repeat("?,", len(columns)-1) + "?)"
     query := fmt.Sprintf("INSERT INTO snd_files (%s) VALUES %s",
         strings.Join(columns, ", "), placeholders)
-    
+
     _, err = tx.Exec(query, rowValues...)
     return err
 }
@@ -1317,12 +1531,12 @@ func insertRcvFile(tx *sql.Tx, fileID int) error {
     if err != nil {
         return err
     }
-    
+
     columns, err := getTableColumns(tx, "rcv_files")
     if err != nil {
         return err
     }
-    
+
     overrideFields := map[string]interface{}{
         "file_id":                fileID,
         "file_status":            "complete",
@@ -1330,7 +1544,7 @@ func insertRcvFile(tx *sql.Tx, fileID int) error {
         "created_at":             time.Now().Format("2006-01-02 15:04:05"),
         "updated_at":             time.Now().Format("2006-01-02 15:04:05"),
     }
-    
+
     rowValues := make([]interface{}, len(columns))
     for i, col := range columns {
         if val, override := overrideFields[col]; override {
@@ -1341,16 +1555,16 @@ func insertRcvFile(tx *sql.Tx, fileID int) error {
             rowValues[i] = nil
         }
     }
-    
+
     placeholders := "(" + strings.Repeat("?,", len(columns)-1) + "?)"
     query := fmt.Sprintf("INSERT INTO rcv_files (%s) VALUES %s",
         strings.Join(columns, ", "), placeholders)
-    
+
     _, err = tx.Exec(query, rowValues...)
     return err
 }
 
-func bulkInsertUniversalMessages(db *sql.DB, messages []UniversalMessage, startMessageID int, jsonDir string, contactID int) error {
+func bulkInsertUniversalMessages(db *sql.DB, messages []UniversalMessage, startMessageID int, jsonDir string, contactID int, simplexFilesDir string) error {
     // Start transaction
     tx, err := db.Begin()
     if err != nil {
@@ -1397,7 +1611,7 @@ func bulkInsertUniversalMessages(db *sql.DB, messages []UniversalMessage, startM
         return fmt.Errorf("failed to bulk insert messages: %w", err)
     }
 
-    err = bulkInsertChatItems(tx, bulkData, jsonDir, contactID)
+    err = bulkInsertChatItems(tx, bulkData, jsonDir, contactID, simplexFilesDir)
     if err != nil {
         return fmt.Errorf("failed to bulk insert chat items: %w", err)
     }
@@ -1440,14 +1654,16 @@ func main() {
     // Command line arguments
     var jsonFilePath string
     var myUsername string
-    var dbPath string
+    var zipPath string
+    var outputZipPath string
     var contactName string
     batchSize := 500 // Hardcoded batch size
 
     flag.StringVar(&jsonFilePath, "json", "", "Path to Discord JSON export file (required)")
     flag.StringVar(&myUsername, "me", "", "Your Discord username to identify sent messages (required)")
     flag.StringVar(&contactName, "contact", "", "SimpleX contact name to import messages to (required)")
-    flag.StringVar(&dbPath, "db", "", "Path to SQLCipher database (required)")
+    flag.StringVar(&zipPath, "zip", "", "Path to SimpleX export ZIP file (required)")
+    flag.StringVar(&outputZipPath, "output", "", "Path for output SimpleX ZIP file (optional, defaults to input with '_updated' suffix)")
     flag.Parse()
 
     if jsonFilePath == "" {
@@ -1459,14 +1675,54 @@ func main() {
     if contactName == "" {
         log.Fatal("Contact name is required. Use -contact flag.")
     }
-    if dbPath == "" {
-        log.Fatal("Database path is required. Use -db flag.")
+    if zipPath == "" {
+        log.Fatal("SimpleX ZIP file path is required. Use -zip flag.")
     }
 
+    // Set default output path if not provided
+    if outputZipPath == "" {
+        dir := filepath.Dir(zipPath)
+        base := filepath.Base(zipPath)
+        ext := filepath.Ext(base)
+        name := base[:len(base)-len(ext)]
+        outputZipPath = filepath.Join(dir, name+"_updated"+ext)
+    }
+
+    // Get database password from environment or prompt user
     password := os.Getenv("SQLCIPHER_KEY")
     if password == "" {
-        log.Fatal("SQLCIPHER_KEY environment variable not set")
+        fmt.Println("SQLCIPHER_KEY environment variable not set.")
+        var err error
+        password, err = promptForPassword()
+        if err != nil {
+            log.Fatalf("Failed to get database password: %v", err)
+        }
+        if password == "" {
+            log.Fatal("Database password is required")
+        }
     }
+
+    // Extract SimpleX ZIP export
+    fmt.Printf("Extracting SimpleX ZIP export from: %s\n", zipPath)
+    extractedDir, err := extractSimplexZip(zipPath)
+    if err != nil {
+        log.Fatalf("Failed to extract SimpleX ZIP: %v", err)
+    }
+    defer os.RemoveAll(extractedDir) // Clean up temporary directory
+
+    // Find database and files directory in extracted content
+    dbPath, err := findSimplexDB(extractedDir)
+    if err != nil {
+        log.Fatalf("Failed to find SimpleX database: %v", err)
+    }
+
+    simplexFilesDir, err := findOrCreateSimplexFilesDir(extractedDir)
+    if err != nil {
+        log.Fatalf("Failed to find or create SimpleX files directory: %v", err)
+    }
+
+    fmt.Printf("Found database at: %s\n", dbPath)
+    fmt.Printf("Using files directory: %s\n", simplexFilesDir)
 
     // Load Discord export
     fmt.Printf("Loading Discord export from: %s\n", jsonFilePath)
@@ -1553,11 +1809,24 @@ func main() {
 
         fmt.Printf("Processing batch %d-%d...\n", i+1, end)
 
-        err = bulkInsertUniversalMessages(db, batch, batchStartID, jsonDir, contactID)
+        err = bulkInsertUniversalMessages(db, batch, batchStartID, jsonDir, contactID, simplexFilesDir)
         if err != nil {
             log.Fatalf("Failed to insert batch %d-%d: %v", i+1, end, err)
         }
 
         fmt.Printf("Successfully inserted batch %d-%d\n", i+1, end)
     }
+
+    // Close database connection before creating ZIP
+    db.Close()
+
+    // Create output ZIP with updated database and files
+    fmt.Printf("Creating updated SimpleX ZIP export: %s\n", outputZipPath)
+    err = createSimplexZip(extractedDir, outputZipPath)
+    if err != nil {
+        log.Fatalf("Failed to create output ZIP: %v", err)
+    }
+
+    fmt.Printf("Successfully created updated SimpleX export: %s\n", outputZipPath)
+    fmt.Printf("Import complete! You can now import this ZIP file back into SimpleX Chat.\n")
 }

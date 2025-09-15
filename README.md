@@ -39,7 +39,7 @@ nix develop
 
 ## Usage
 
-**Make sure to take the latest export of your SimpleX Chat DB and back it up before proceeding!**
+**Make sure to export your SimpleX Chat database and back it up before proceeding!**
 
 ### Step 1: Export Discord Chat
 
@@ -52,43 +52,80 @@ DiscordChatExporter.Cli export --channel CHANNEL_ID --token "TOKEN" --output . -
 
 This will create a JSON file and a `_Files` folder containing all attachments.
 
-### Step 2: Find Your SimpleX Contact
+### Step 2: Export SimpleX Chat Database
 
-First, identify the contact name you want to import messages to. You can check your SimpleX contacts in the app or database.
+Export your SimpleX Chat database to a ZIP file using the SimpleX app:
 
-### Step 3: Set Database Password
+1. Open SimpleX Chat
+2. Go to Settings > Database
+3. Choose "Export database" 
+4. Save the ZIP file containing your database and files
 
-Export your SimpleX database password as an environment variable:
+### Step 3: Find Your SimpleX Contact
 
+Identify the contact name you want to import messages to. You can check your SimpleX contacts in the app.
+
+### Step 4: Prepare Database Password
+
+You can provide your SimpleX database password in two ways:
+
+**Option A: Environment variable (recommended for scripts):**
 ```bash
 export SQLCIPHER_KEY='your-simplex-database-password'
 ```
 
-### Step 4: Run the Import
+**Option B: Interactive prompt (will be prompted if environment variable not set):**
+The tool will securely prompt for your password if the `SQLCIPHER_KEY` environment variable is not set.
+
+### Step 5: Run the Import
 
 ```bash
 go run main.go \
-  -json ./path/to/your-export.json \
+  -json ./path/to/your-discord-export.json \
   -me "YourDiscordUsername" \
   -contact "FriendSimpleXContactUserName" \
-  -db /path/to/simplex/simplex_v1_chat.db
+  -zip /path/to/simplex-export.zip \
+  -output ./updated-simplex-export.zip
 ```
 
 **Parameters:**
 - `-json`: Path to the Discord export JSON file
 - `-me`: Your Discord username (to distinguish sent vs received messages)
 - `-contact`: SimpleX contact name to import messages to
-- `-db`: Path to your SimpleX chat database
+- `-zip`: Path to your SimpleX export ZIP file
+- `-output`: Path for the updated SimpleX ZIP file (optional, defaults to input with '_updated' suffix)
 
-### Example
+### Step 6: Import Back to SimpleX
 
+Import the updated ZIP file back into SimpleX Chat:
+
+1. Open SimpleX Chat
+2. Go to Settings > Database
+3. Choose "Import database"
+4. Select the updated ZIP file created by the tool
+
+### Examples
+
+**With environment variable:**
 ```bash
 export SQLCIPHER_KEY='my-secret-password'
 go run main.go \
   -json ./discord-export.json \
   -me "john_doe" \
   -contact "alice" \
-  -db ~/.local/share/simplex/simplex_v1_chat.db
+  -zip ./simplex-export.zip \
+  -output ./simplex-with-discord-messages.zip
+```
+
+**With interactive password prompt:**
+```bash
+go run main.go \
+  -json ./discord-export.json \
+  -me "john_doe" \
+  -contact "alice" \
+  -zip ./simplex-export.zip \
+  -output ./simplex-with-discord-messages.zip
+# Tool will prompt: "Enter SimpleX database password: " (password hidden)
 ```
 
 ## Version
@@ -103,12 +140,14 @@ simplexmq: v6.4.4.1 ( )
 
 ## How It Works
 
-1. **Parses Discord JSON export** and extracts messages, attachments, and metadata
-2. **Generates video thumbnails** using FFmpeg for proper display in SimpleX
-3. **Copies attachments** to SimpleX files directory for accessibility
-4. **Maps Discord users** to SimpleX contacts based on your specification
-5. **Bulk inserts** messages into SimpleX database with proper relationships
-6. **Preserves message order** and reply threading from Discord
+1. **Extracts SimpleX ZIP export** to a temporary directory
+2. **Parses Discord JSON export** and extracts messages, attachments, and metadata
+3. **Generates video thumbnails** using FFmpeg for proper display in SimpleX
+4. **Copies attachments** to the extracted SimpleX files directory for accessibility
+5. **Maps Discord users** to SimpleX contacts based on your specification
+6. **Bulk inserts** messages into the extracted SimpleX database with proper relationships
+7. **Preserves message order** and reply threading from Discord
+8. **Creates updated ZIP export** with all imported messages and files ready for SimpleX import
 
 ## Supported File Types
 
