@@ -1,6 +1,6 @@
 module github.com/ritiek/discord-to-simplex
 
-go 1.24.2
+go 1.24.0
 
 require (
 	github.com/xeodou/go-sqlcipher v0.0.0-20200727080346-d681773ef093
